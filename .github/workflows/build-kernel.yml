@@ -7,10 +7,6 @@ on:
         description: 'Your Octopus board name (e.g. bobba, dorp, blooglet, fleex)'
         required: true
         type: string
-      shim_url:
-        description: 'Direct download URL for your Octopus RMA shim (.bin or .zip)'
-        required: true
-        type: string
       desktop:
         description: 'Desktop environment'
         required: true
@@ -63,43 +59,8 @@ jobs:
             e2fsprogs kmod pv cryptsetup
 
       # ============================================================
-      # PHASE 1: Download shim, extract cmdline
-      # Shim is saved to ./shim.bin (reused by shimboot later)
-      # Cmdline is saved to ./kernel.cmdline
-      # ============================================================
-      - name: Download shim and extract cmdline
-        run: |
-          wget -q --show-progress "${{ github.event.inputs.shim_url }}" -O shim_raw
-
-          if file shim_raw | grep -qi "zip"; then
-            unzip shim_raw -d shim_extracted
-            cp "$(find shim_extracted -name '*.bin' | head -1)" shim.bin
-            rm -rf shim_extracted shim_raw
-          else
-            mv shim_raw shim.bin
-          fi
-
-          echo "=== Shim partitions ==="
-          cgpt show shim.bin
-
-          KERN_START=$(cgpt show -i 2 -b shim.bin)
-          KERN_SIZE=$(cgpt show -i 2 -s shim.bin)
-          dd if=shim.bin of=shim_kernel.img bs=512 skip="$KERN_START" count="$KERN_SIZE"
-
-          CMDLINE=$(futility dump_kernel_config shim_kernel.img 2>/dev/null || echo "")
-          if [ -z "$CMDLINE" ]; then
-            echo "Warning: could not extract cmdline, using safe default"
-            CMDLINE="console=tty1 init=/sbin/init rootwait ro"
-          fi
-          echo "Cmdline: $CMDLINE"
-          echo "$CMDLINE" > kernel.cmdline
-
-          rm -f shim_kernel.img
-          df -h
-
-      # ============================================================
-      # PHASE 2: Build ChromeOS 6.6 kernel
-      # bzImage is saved to ./bzImage, then source is deleted
+      # PHASE 1: Build ChromeOS 6.6 kernel
+      # bzImage saved to ./bzImage, source deleted for disk space
       # ============================================================
       - name: Clone ChromeOS kernel 6.6
         run: |
@@ -171,13 +132,47 @@ jobs:
           cp kernel/arch/x86/boot/bzImage ./bzImage
           cp kernel/.config ./kernel.config
           rm -rf kernel
-          echo "=== Disk after source deletion ==="
+          echo "=== Disk after kernel source deletion ==="
           df -h
 
       # ============================================================
-      # PHASE 3: Sign kernel
-      # Output is ./kernel.vboot
+      # PHASE 2: Build shimboot image
+      # build_complete.sh downloads its own shim automatically.
+      # Output: shimboot/data/shimboot_image.bin
       # ============================================================
+      - name: Clone shimboot
+        run: git clone --depth=1 https://github.com/ading2210/shimboot shimboot
+
+      - name: Build shimboot image
+        working-directory: shimboot
+        run: |
+          sudo ./build_complete.sh "${{ github.event.inputs.board_name }}" \
+            desktop="${{ github.event.inputs.desktop }}" \
+            quiet=1
+          echo "=== Build output ==="
+          ls -lh data/
+          df -h
+
+      # ============================================================
+      # PHASE 3: Extract cmdline from the built image's kernel,
+      # then sign our custom kernel with it.
+      # ============================================================
+      - name: Extract cmdline from shimboot image kernel
+        run: |
+          IMAGE="shimboot/data/shimboot_image.bin"
+          KERN_START=$(cgpt show -i 2 -b "$IMAGE")
+          KERN_SIZE=$(cgpt show -i 2 -s "$IMAGE")
+          dd if="$IMAGE" of=shim_kernel.img bs=512 skip="$KERN_START" count="$KERN_SIZE"
+
+          CMDLINE=$(futility dump_kernel_config shim_kernel.img 2>/dev/null || echo "")
+          if [ -z "$CMDLINE" ]; then
+            echo "Warning: could not extract cmdline, using safe default"
+            CMDLINE="console=tty1 init=/sbin/init rootwait ro"
+          fi
+          echo "Cmdline: $CMDLINE"
+          echo "$CMDLINE" > kernel.cmdline
+          rm -f shim_kernel.img
+
       - name: Get vboot signing keys
         run: |
           if [ ! -d "/usr/share/vboot/devkeys" ]; then
@@ -209,32 +204,7 @@ jobs:
           df -h
 
       # ============================================================
-      # PHASE 4: Build full shimboot image
-      # Output lands at ./shimboot/data/shimboot_image.bin
-      # ============================================================
-      - name: Clone shimboot
-        run: git clone --depth=1 https://github.com/ading2210/shimboot shimboot
-
-      - name: Move shim into shimboot data dir
-        run: |
-          mkdir -p shimboot/data
-          mv shim.bin shimboot/data/shim.bin
-
-      - name: Build shimboot image
-        working-directory: shimboot
-        run: |
-          sudo ./build_complete.sh "${{ github.event.inputs.board_name }}" \
-            quiet=1 \
-            desktop="${{ github.event.inputs.desktop }}" \
-            data_dir=./data
-          echo "=== Build output ==="
-          ls -lh data/
-          df -h
-
-      # ============================================================
-      # PHASE 5: Swap kernel partition in shimboot image
-      # Replaces old shim kernel with our chromeos-6.6 kernel
-      # Image stays at ./shimboot/data/shimboot_image.bin
+      # PHASE 4: Swap kernel partition in shimboot image
       # ============================================================
       - name: Swap kernel partition
         run: |
@@ -251,17 +221,13 @@ jobs:
           echo "New kernel needs: $NEW_KERN_SECTORS sectors, partition has: $KERN_SIZE sectors"
 
           if [ "$NEW_KERN_SECTORS" -gt "$KERN_SIZE" ]; then
-            echo "ERROR: New kernel is larger than the kernel partition in the image"
-            echo "Kernel size: $(stat -c%s kernel.vboot) bytes"
-            echo "Partition size: $(( KERN_SIZE * 512 )) bytes"
+            echo "ERROR: New kernel ($NEW_KERN_SECTORS sectors) is larger than partition ($KERN_SIZE sectors)"
             exit 1
           fi
 
-          # Zero out partition then write new kernel
           dd if=/dev/zero of="$IMAGE" bs=512 seek="$KERN_START" count="$KERN_SIZE" conv=notrunc
           dd if=kernel.vboot of="$IMAGE" bs=512 seek="$KERN_START" conv=notrunc
 
-          # Verify the swapped kernel reads back correctly
           dd if="$IMAGE" of=verify_kernel.img bs=512 skip="$KERN_START" count="$KERN_SIZE"
           futility vbutil_kernel --verify verify_kernel.img && \
             echo "Kernel swap verified OK" || \
@@ -269,9 +235,7 @@ jobs:
           rm -f verify_kernel.img
 
       # ============================================================
-      # PHASE 6: Zip and upload
-      # Final artifact: shimboot_<board>_chromeos-6.6.zip
-      # Flash this exactly like a normal shimboot image
+      # PHASE 5: Zip and upload
       # ============================================================
       - name: Zip final image
         run: |
