@@ -1,0 +1,201 @@
+name: Build ChromeOS Kernel for Octopus (Shimboot)
+
+on:
+  # Run manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: 'ChromeOS kernel branch to build'
+        required: true
+        default: 'chromeos-6.1'
+        type: choice
+        options:
+          - chromeos-6.1
+          - chromeos-6.6
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+    # Free tier allows up to 6 hours, kernel build needs ~1-2
+    timeout-minutes: 180
+
+    steps:
+      - name: Free up disk space
+        run: |
+          echo "=== Disk before cleanup ==="
+          df -h
+          # Remove large unnecessary packages to make room for kernel source
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache
+          sudo apt-get clean
+          echo "=== Disk after cleanup ==="
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git build-essential bc bison flex \
+            libssl-dev libelf-dev libncurses-dev \
+            python3 cpio lz4 zstd \
+            vboot-kernel-utils \
+            wget curl
+
+      - name: Clone ChromeOS kernel (shallow)
+        run: |
+          echo "Cloning ${{ github.event.inputs.kernel_branch }}..."
+          git clone \
+            --depth=1 \
+            --branch ${{ github.event.inputs.kernel_branch }} \
+            https://chromium.googlesource.com/chromiumos/third_party/kernel \
+            kernel
+          echo "Clone complete"
+          df -h
+
+      - name: Configure kernel for Octopus (Gemini Lake x86_64)
+        working-directory: kernel
+        run: |
+          # Use the ChromiumOS x86_64 defconfig as base
+          # This includes all the board-specific patches Google maintains
+          if [ -f "arch/x86/configs/chromiumos-x86_64_defconfig" ]; then
+            make chromiumos-x86_64_defconfig
+          else
+            # Fallback: use standard x86_64 defconfig
+            make x86_64_defconfig
+          fi
+
+          # Apply ChromeOS config fragments if script exists
+          if [ -f "chromeos/scripts/prepareconfig" ]; then
+            bash chromeos/scripts/prepareconfig chromiumos-x86_64 || true
+          fi
+
+          # Enable critical features for Shimboot / modern apps
+          # using a script to safely set config options
+          ./scripts/config --enable CONFIG_OVERLAY_FS
+          ./scripts/config --enable CONFIG_SQUASHFS
+          ./scripts/config --enable CONFIG_SQUASHFS_XZ
+          ./scripts/config --enable CONFIG_SQUASHFS_LZ4
+
+          # cgroups - needed for Flatpak, containers, Sober
+          ./scripts/config --enable CONFIG_CGROUPS
+          ./scripts/config --enable CONFIG_CGROUP_BPF
+          ./scripts/config --enable CONFIG_MEMCG
+          ./scripts/config --enable CONFIG_CGROUP_DEVICE
+          ./scripts/config --enable CONFIG_CGROUP_CPUACCT
+
+          # io_uring - needed by Sober and modern runtimes
+          ./scripts/config --enable CONFIG_IO_URING
+
+          # Namespaces - needed for Flatpak bwrap sandboxing
+          ./scripts/config --enable CONFIG_NAMESPACES
+          ./scripts/config --enable CONFIG_USER_NS
+          ./scripts/config --enable CONFIG_PID_NS
+          ./scripts/config --enable CONFIG_NET_NS
+
+          # Swap support (disabled in shim kernels by default)
+          ./scripts/config --enable CONFIG_SWAP
+          ./scripts/config --enable CONFIG_ZSWAP
+          ./scripts/config --enable CONFIG_ZRAM
+
+          # Filesystems
+          ./scripts/config --enable CONFIG_EXT4_FS
+          ./scripts/config --enable CONFIG_BTRFS_FS
+          ./scripts/config --enable CONFIG_TMPFS
+
+          # eMMC / storage for Octopus
+          ./scripts/config --enable CONFIG_MMC
+          ./scripts/config --enable CONFIG_MMC_SDHCI
+          ./scripts/config --enable CONFIG_MMC_SDHCI_ACPI
+          ./scripts/config --enable CONFIG_MMC_SDHCI_PCI
+
+          # WiFi - iwlwifi for Octopus (Intel Gemini Lake)
+          ./scripts/config --enable CONFIG_IWLWIFI
+          ./scripts/config --enable CONFIG_IWLMVM
+
+          # GPU - Intel i915 for Gemini Lake
+          ./scripts/config --enable CONFIG_DRM
+          ./scripts/config --enable CONFIG_DRM_I915
+
+          # Audio - Intel HDA
+          ./scripts/config --enable CONFIG_SND_HDA_INTEL
+          ./scripts/config --enable CONFIG_SND_HDA_CODEC_HDMI
+
+          # Accept all new config options as defaults
+          make olddefconfig
+
+          echo "=== Config summary ==="
+          grep -E "CONFIG_IO_URING|CONFIG_USER_NS|CONFIG_SWAP|CONFIG_OVERLAY_FS|CONFIG_CGROUP_BPF" .config
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          echo "Starting kernel build with 2 jobs..."
+          make -j2 bzImage 2>&1 | tail -20
+          echo "=== Build complete ==="
+          ls -lh arch/x86/boot/bzImage
+
+      - name: Get vboot signing keys
+        run: |
+          # Keys come with vboot-kernel-utils package
+          if [ -d "/usr/share/vboot/devkeys" ]; then
+            echo "Keys found at /usr/share/vboot/devkeys"
+            ls /usr/share/vboot/devkeys/
+          else
+            # Build from source if not available
+            echo "Fetching vboot_reference for keys..."
+            git clone --depth=1 \
+              https://chromium.googlesource.com/chromiumos/platform/vboot_reference \
+              vboot_reference
+            cd vboot_reference
+            make -j2
+            mkdir -p /usr/share/vboot/devkeys
+            cp tests/devkeys/* /usr/share/vboot/devkeys/
+          fi
+
+      - name: Create kernel cmdline
+        run: |
+          # This is the standard shimboot cmdline
+          # console=tty1 keeps output visible during boot
+          cat > kernel.cmdline << 'EOF'
+          console=tty1 init=/sbin/init rootwait ro
+          EOF
+          # Remove leading whitespace
+          sed -i 's/^[[:space:]]*//' kernel.cmdline
+          cat kernel.cmdline
+
+      - name: Create dummy bootloader stub
+        run: |
+          dd if=/dev/zero of=bootloader.bin bs=512 count=1
+
+      - name: Pack kernel with futility (vboot format)
+        run: |
+          # Determine key location
+          KEYDIR="/usr/share/vboot/devkeys"
+
+          futility vbutil_kernel \
+            --pack kernel.vboot \
+            --keyblock "${KEYDIR}/recovery_kernel.keyblock" \
+            --signprivate "${KEYDIR}/recovery_kernel_data_key.vbprivk" \
+            --config kernel.cmdline \
+            --vmlinuz kernel/arch/x86/boot/bzImage \
+            --bootloader bootloader.bin \
+            --version 1 \
+            --arch x86_64
+
+          echo "=== Verifying signed kernel ==="
+          futility vbutil_kernel --verify kernel.vboot
+
+          echo "=== Final kernel size ==="
+          ls -lh kernel.vboot
+
+      - name: Save kernel as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: octopus-chromeos-kernel-${{ github.event.inputs.kernel_branch }}
+          path: |
+            kernel.vboot
+            kernel/.config
+          retention-days: 30
+          if-no-files-found: error
