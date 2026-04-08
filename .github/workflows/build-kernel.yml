@@ -26,9 +26,6 @@ jobs:
 
     steps:
 
-      # ============================================================
-      # PHASE 0: Free disk space
-      # ============================================================
       - name: Free disk space
         run: |
           echo "=== Before cleanup ==="
@@ -58,10 +55,6 @@ jobs:
             cgpt debootstrap fdisk \
             e2fsprogs kmod pv cryptsetup
 
-      # ============================================================
-      # PHASE 1: Build ChromeOS 6.6 kernel
-      # bzImage saved to ./bzImage, source deleted for disk space
-      # ============================================================
       - name: Clone ChromeOS kernel 6.6
         run: |
           git clone --depth=1 \
@@ -135,28 +128,20 @@ jobs:
           echo "=== Disk after kernel source deletion ==="
           df -h
 
-      # ============================================================
-      # PHASE 2: Build shimboot image
-      # build_complete.sh downloads its own shim automatically.
-      # Output: shimboot/data/shimboot_image.bin
-      # ============================================================
       - name: Clone shimboot
         run: git clone --depth=1 https://github.com/ading2210/shimboot shimboot
 
       - name: Build shimboot image
         working-directory: shimboot
         run: |
+          set -x
           sudo ./build_complete.sh "${{ github.event.inputs.board_name }}" \
-            desktop="${{ github.event.inputs.desktop }}" \
-            quiet=1
-          echo "=== Build output ==="
-          ls -lh data/
+            desktop="${{ github.event.inputs.desktop }}"
+          echo "=== Exit code: $? ==="
+          echo "=== Contents of data/ ==="
+          ls -lah data/ || echo "data/ does not exist"
           df -h
 
-      # ============================================================
-      # PHASE 3: Extract cmdline from the built image's kernel,
-      # then sign our custom kernel with it.
-      # ============================================================
       - name: Extract cmdline from shimboot image kernel
         run: |
           IMAGE="shimboot/data/shimboot_image.bin"
@@ -203,9 +188,6 @@ jobs:
           ls -lh kernel.vboot
           df -h
 
-      # ============================================================
-      # PHASE 4: Swap kernel partition in shimboot image
-      # ============================================================
       - name: Swap kernel partition
         run: |
           IMAGE="shimboot/data/shimboot_image.bin"
@@ -234,9 +216,6 @@ jobs:
             echo "Warning: verification returned non-zero"
           rm -f verify_kernel.img
 
-      # ============================================================
-      # PHASE 5: Zip and upload
-      # ============================================================
       - name: Zip final image
         run: |
           zip -j shimboot_${{ github.event.inputs.board_name }}_chromeos-6.6.zip \
