@@ -1,201 +1,296 @@
-name: Build ChromeOS Kernel for Octopus (Shimboot)
+name: Build Shimboot Image (Octopus + ChromeOS 6.6 Kernel)
 
 on:
-  # Run manually from the Actions tab
   workflow_dispatch:
     inputs:
-      kernel_branch:
-        description: 'ChromeOS kernel branch to build'
+      board_name:
+        description: 'Your Octopus board name (e.g. bobba, dorp, blooglet, fleex)'
         required: true
-        default: 'chromeos-6.1'
+        type: string
+      shim_url:
+        description: 'Direct download URL for your Octopus RMA shim (.bin or .zip)'
+        required: true
+        type: string
+      desktop:
+        description: 'Desktop environment'
+        required: true
+        default: 'xfce'
         type: choice
         options:
-          - chromeos-6.1
-          - chromeos-6.6
+          - xfce
+          - gnome
+          - kde
+          - lxde
+          - mate
 
 jobs:
-  build-kernel:
+  build:
     runs-on: ubuntu-latest
-    # Free tier allows up to 6 hours, kernel build needs ~1-2
-    timeout-minutes: 180
+    timeout-minutes: 360
 
     steps:
-      - name: Free up disk space
+
+      # ============================================================
+      # PHASE 0: Free disk space
+      # ============================================================
+      - name: Free disk space
         run: |
-          echo "=== Disk before cleanup ==="
+          echo "=== Before cleanup ==="
           df -h
-          # Remove large unnecessary packages to make room for kernel source
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/share/swift \
+            "$AGENT_TOOLSDIRECTORY"
           sudo apt-get clean
-          echo "=== Disk after cleanup ==="
+          sudo apt-get autoremove -y
+          echo "=== After cleanup ==="
           df -h
 
-      - name: Install build dependencies
+      - name: Install all dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             git build-essential bc bison flex \
             libssl-dev libelf-dev libncurses-dev \
             python3 cpio lz4 zstd \
-            vboot-kernel-utils \
-            wget curl
+            vboot-kernel-utils vboot-utils \
+            wget curl unzip zip binwalk pcregrep \
+            cgpt debootstrap fdisk \
+            e2fsprogs kmod pv cryptsetup
 
-      - name: Clone ChromeOS kernel (shallow)
+      # ============================================================
+      # PHASE 1: Download shim, extract cmdline
+      # Shim is saved to ./shim.bin (reused by shimboot later)
+      # Cmdline is saved to ./kernel.cmdline
+      # ============================================================
+      - name: Download shim and extract cmdline
         run: |
-          echo "Cloning ${{ github.event.inputs.kernel_branch }}..."
-          git clone \
-            --depth=1 \
-            --branch ${{ github.event.inputs.kernel_branch }} \
+          wget -q --show-progress "${{ github.event.inputs.shim_url }}" -O shim_raw
+
+          if file shim_raw | grep -qi "zip"; then
+            unzip shim_raw -d shim_extracted
+            cp "$(find shim_extracted -name '*.bin' | head -1)" shim.bin
+            rm -rf shim_extracted shim_raw
+          else
+            mv shim_raw shim.bin
+          fi
+
+          echo "=== Shim partitions ==="
+          cgpt show shim.bin
+
+          KERN_START=$(cgpt show -i 2 -b shim.bin)
+          KERN_SIZE=$(cgpt show -i 2 -s shim.bin)
+          dd if=shim.bin of=shim_kernel.img bs=512 skip="$KERN_START" count="$KERN_SIZE"
+
+          CMDLINE=$(futility dump_kernel_config shim_kernel.img 2>/dev/null || echo "")
+          if [ -z "$CMDLINE" ]; then
+            echo "Warning: could not extract cmdline, using safe default"
+            CMDLINE="console=tty1 init=/sbin/init rootwait ro"
+          fi
+          echo "Cmdline: $CMDLINE"
+          echo "$CMDLINE" > kernel.cmdline
+
+          rm -f shim_kernel.img
+          df -h
+
+      # ============================================================
+      # PHASE 2: Build ChromeOS 6.6 kernel
+      # bzImage is saved to ./bzImage, then source is deleted
+      # ============================================================
+      - name: Clone ChromeOS kernel 6.6
+        run: |
+          git clone --depth=1 \
+            --branch chromeos-6.6 \
             https://chromium.googlesource.com/chromiumos/third_party/kernel \
             kernel
-          echo "Clone complete"
           df -h
 
       - name: Configure kernel for Octopus (Gemini Lake x86_64)
         working-directory: kernel
         run: |
-          # Use the ChromiumOS x86_64 defconfig as base
-          # This includes all the board-specific patches Google maintains
           if [ -f "arch/x86/configs/chromiumos-x86_64_defconfig" ]; then
             make chromiumos-x86_64_defconfig
           else
-            # Fallback: use standard x86_64 defconfig
             make x86_64_defconfig
           fi
-
-          # Apply ChromeOS config fragments if script exists
-          if [ -f "chromeos/scripts/prepareconfig" ]; then
+          [ -f "chromeos/scripts/prepareconfig" ] && \
             bash chromeos/scripts/prepareconfig chromiumos-x86_64 || true
-          fi
 
-          # Enable critical features for Shimboot / modern apps
-          # using a script to safely set config options
           ./scripts/config --enable CONFIG_OVERLAY_FS
           ./scripts/config --enable CONFIG_SQUASHFS
           ./scripts/config --enable CONFIG_SQUASHFS_XZ
           ./scripts/config --enable CONFIG_SQUASHFS_LZ4
-
-          # cgroups - needed for Flatpak, containers, Sober
+          ./scripts/config --enable CONFIG_SQUASHFS_ZLIB
+          ./scripts/config --enable CONFIG_SWAP
+          ./scripts/config --enable CONFIG_ZSWAP
+          ./scripts/config --enable CONFIG_ZRAM
           ./scripts/config --enable CONFIG_CGROUPS
           ./scripts/config --enable CONFIG_CGROUP_BPF
           ./scripts/config --enable CONFIG_MEMCG
           ./scripts/config --enable CONFIG_CGROUP_DEVICE
           ./scripts/config --enable CONFIG_CGROUP_CPUACCT
-
-          # io_uring - needed by Sober and modern runtimes
+          ./scripts/config --enable CONFIG_CGROUP_PIDS
+          ./scripts/config --enable CONFIG_CGROUP_FREEZER
           ./scripts/config --enable CONFIG_IO_URING
-
-          # Namespaces - needed for Flatpak bwrap sandboxing
           ./scripts/config --enable CONFIG_NAMESPACES
           ./scripts/config --enable CONFIG_USER_NS
           ./scripts/config --enable CONFIG_PID_NS
           ./scripts/config --enable CONFIG_NET_NS
-
-          # Swap support (disabled in shim kernels by default)
-          ./scripts/config --enable CONFIG_SWAP
-          ./scripts/config --enable CONFIG_ZSWAP
-          ./scripts/config --enable CONFIG_ZRAM
-
-          # Filesystems
+          ./scripts/config --enable CONFIG_UTS_NS
+          ./scripts/config --enable CONFIG_IPC_NS
+          ./scripts/config --enable CONFIG_BPF
+          ./scripts/config --enable CONFIG_BPF_SYSCALL
           ./scripts/config --enable CONFIG_EXT4_FS
           ./scripts/config --enable CONFIG_BTRFS_FS
           ./scripts/config --enable CONFIG_TMPFS
-
-          # eMMC / storage for Octopus
+          ./scripts/config --enable CONFIG_TMPFS_POSIX_ACL
           ./scripts/config --enable CONFIG_MMC
           ./scripts/config --enable CONFIG_MMC_SDHCI
           ./scripts/config --enable CONFIG_MMC_SDHCI_ACPI
           ./scripts/config --enable CONFIG_MMC_SDHCI_PCI
-
-          # WiFi - iwlwifi for Octopus (Intel Gemini Lake)
           ./scripts/config --enable CONFIG_IWLWIFI
           ./scripts/config --enable CONFIG_IWLMVM
-
-          # GPU - Intel i915 for Gemini Lake
           ./scripts/config --enable CONFIG_DRM
           ./scripts/config --enable CONFIG_DRM_I915
-
-          # Audio - Intel HDA
           ./scripts/config --enable CONFIG_SND_HDA_INTEL
           ./scripts/config --enable CONFIG_SND_HDA_CODEC_HDMI
-
-          # Accept all new config options as defaults
+          ./scripts/config --enable CONFIG_USB_SUPPORT
+          ./scripts/config --enable CONFIG_USB_XHCI_HCD
           make olddefconfig
-
-          echo "=== Config summary ==="
-          grep -E "CONFIG_IO_URING|CONFIG_USER_NS|CONFIG_SWAP|CONFIG_OVERLAY_FS|CONFIG_CGROUP_BPF" .config
 
       - name: Build kernel
         working-directory: kernel
-        run: |
-          echo "Starting kernel build with 2 jobs..."
-          make -j2 bzImage 2>&1 | tail -20
-          echo "=== Build complete ==="
-          ls -lh arch/x86/boot/bzImage
+        run: make -j2 bzImage 2>&1 | tail -20
 
+      - name: Save bzImage and delete kernel source
+        run: |
+          cp kernel/arch/x86/boot/bzImage ./bzImage
+          cp kernel/.config ./kernel.config
+          rm -rf kernel
+          echo "=== Disk after source deletion ==="
+          df -h
+
+      # ============================================================
+      # PHASE 3: Sign kernel
+      # Output is ./kernel.vboot
+      # ============================================================
       - name: Get vboot signing keys
         run: |
-          # Keys come with vboot-kernel-utils package
-          if [ -d "/usr/share/vboot/devkeys" ]; then
-            echo "Keys found at /usr/share/vboot/devkeys"
-            ls /usr/share/vboot/devkeys/
-          else
-            # Build from source if not available
-            echo "Fetching vboot_reference for keys..."
+          if [ ! -d "/usr/share/vboot/devkeys" ]; then
             git clone --depth=1 \
               https://chromium.googlesource.com/chromiumos/platform/vboot_reference \
               vboot_reference
-            cd vboot_reference
-            make -j2
-            mkdir -p /usr/share/vboot/devkeys
-            cp tests/devkeys/* /usr/share/vboot/devkeys/
+            cd vboot_reference && make -j2
+            sudo mkdir -p /usr/share/vboot/devkeys
+            sudo cp tests/devkeys/* /usr/share/vboot/devkeys/
+            cd ..
+            rm -rf vboot_reference
           fi
 
-      - name: Create kernel cmdline
-        run: |
-          # This is the standard shimboot cmdline
-          # console=tty1 keeps output visible during boot
-          cat > kernel.cmdline << 'EOF'
-          console=tty1 init=/sbin/init rootwait ro
-          EOF
-          # Remove leading whitespace
-          sed -i 's/^[[:space:]]*//' kernel.cmdline
-          cat kernel.cmdline
-
-      - name: Create dummy bootloader stub
+      - name: Sign kernel
         run: |
           dd if=/dev/zero of=bootloader.bin bs=512 count=1
-
-      - name: Pack kernel with futility (vboot format)
-        run: |
-          # Determine key location
-          KEYDIR="/usr/share/vboot/devkeys"
-
           futility vbutil_kernel \
             --pack kernel.vboot \
-            --keyblock "${KEYDIR}/recovery_kernel.keyblock" \
-            --signprivate "${KEYDIR}/recovery_kernel_data_key.vbprivk" \
+            --keyblock /usr/share/vboot/devkeys/recovery_kernel.keyblock \
+            --signprivate /usr/share/vboot/devkeys/recovery_kernel_data_key.vbprivk \
             --config kernel.cmdline \
-            --vmlinuz kernel/arch/x86/boot/bzImage \
+            --vmlinuz bzImage \
             --bootloader bootloader.bin \
             --version 1 \
             --arch x86_64
-
-          echo "=== Verifying signed kernel ==="
           futility vbutil_kernel --verify kernel.vboot
-
-          echo "=== Final kernel size ==="
+          rm -f bzImage bootloader.bin
           ls -lh kernel.vboot
+          df -h
 
-      - name: Save kernel as artifact
+      # ============================================================
+      # PHASE 4: Build full shimboot image
+      # Output lands at ./shimboot/data/shimboot_image.bin
+      # ============================================================
+      - name: Clone shimboot
+        run: git clone --depth=1 https://github.com/ading2210/shimboot shimboot
+
+      - name: Move shim into shimboot data dir
+        run: |
+          mkdir -p shimboot/data
+          mv shim.bin shimboot/data/shim.bin
+
+      - name: Build shimboot image
+        working-directory: shimboot
+        run: |
+          sudo ./build_complete.sh "${{ github.event.inputs.board_name }}" \
+            quiet=1 \
+            desktop="${{ github.event.inputs.desktop }}" \
+            data_dir=./data
+          echo "=== Build output ==="
+          ls -lh data/
+          df -h
+
+      # ============================================================
+      # PHASE 5: Swap kernel partition in shimboot image
+      # Replaces old shim kernel with our chromeos-6.6 kernel
+      # Image stays at ./shimboot/data/shimboot_image.bin
+      # ============================================================
+      - name: Swap kernel partition
+        run: |
+          IMAGE="shimboot/data/shimboot_image.bin"
+
+          echo "=== Image partition table ==="
+          cgpt show "$IMAGE"
+
+          KERN_START=$(cgpt show -i 2 -b "$IMAGE")
+          KERN_SIZE=$(cgpt show -i 2 -s "$IMAGE")
+          echo "Kernel partition: start=$KERN_START sectors, size=$KERN_SIZE sectors"
+
+          NEW_KERN_SECTORS=$(( ($(stat -c%s kernel.vboot) + 511) / 512 ))
+          echo "New kernel needs: $NEW_KERN_SECTORS sectors, partition has: $KERN_SIZE sectors"
+
+          if [ "$NEW_KERN_SECTORS" -gt "$KERN_SIZE" ]; then
+            echo "ERROR: New kernel is larger than the kernel partition in the image"
+            echo "Kernel size: $(stat -c%s kernel.vboot) bytes"
+            echo "Partition size: $(( KERN_SIZE * 512 )) bytes"
+            exit 1
+          fi
+
+          # Zero out partition then write new kernel
+          dd if=/dev/zero of="$IMAGE" bs=512 seek="$KERN_START" count="$KERN_SIZE" conv=notrunc
+          dd if=kernel.vboot of="$IMAGE" bs=512 seek="$KERN_START" conv=notrunc
+
+          # Verify the swapped kernel reads back correctly
+          dd if="$IMAGE" of=verify_kernel.img bs=512 skip="$KERN_START" count="$KERN_SIZE"
+          futility vbutil_kernel --verify verify_kernel.img && \
+            echo "Kernel swap verified OK" || \
+            echo "Warning: verification returned non-zero"
+          rm -f verify_kernel.img
+
+      # ============================================================
+      # PHASE 6: Zip and upload
+      # Final artifact: shimboot_<board>_chromeos-6.6.zip
+      # Flash this exactly like a normal shimboot image
+      # ============================================================
+      - name: Zip final image
+        run: |
+          zip -j shimboot_${{ github.event.inputs.board_name }}_chromeos-6.6.zip \
+            shimboot/data/shimboot_image.bin
+          ls -lh shimboot_${{ github.event.inputs.board_name }}_chromeos-6.6.zip
+
+      - name: Upload bootable shimboot image
         uses: actions/upload-artifact@v4
         with:
-          name: octopus-chromeos-kernel-${{ github.event.inputs.kernel_branch }}
-          path: |
-            kernel.vboot
-            kernel/.config
+          name: shimboot-${{ github.event.inputs.board_name }}-chromeos-6.6
+          path: shimboot_${{ github.event.inputs.board_name }}_chromeos-6.6.zip
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload kernel config
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-config
+          path: kernel.config
           retention-days: 30
           if-no-files-found: error
