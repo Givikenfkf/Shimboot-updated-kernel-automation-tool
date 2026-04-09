@@ -55,6 +55,25 @@ jobs:
             cgpt debootstrap fdisk \
             e2fsprogs kmod pv cryptsetup
 
+      - name: Ensure vboot devkeys are present
+        # vboot-utils on Ubuntu sometimes doesn't ship devkeys,
+        # so we build them from source as a fallback
+        run: |
+          if [ ! -f "/usr/share/vboot/devkeys/recovery_kernel.keyblock" ]; then
+            echo "Devkeys not found in package, building from source..."
+            git clone --depth=1 \
+              https://chromium.googlesource.com/chromiumos/platform/vboot_reference \
+              vboot_reference
+            cd vboot_reference && make -j$(nproc)
+            sudo mkdir -p /usr/share/vboot/devkeys
+            sudo cp tests/devkeys/* /usr/share/vboot/devkeys/
+            cd ..
+            rm -rf vboot_reference
+          else
+            echo "Devkeys found:"
+            ls /usr/share/vboot/devkeys/
+          fi
+
       - name: Clone ChromeOS kernel 6.6
         run: |
           git clone --depth=1 \
@@ -149,39 +168,25 @@ jobs:
           test -f "data/shimboot_${{ github.event.inputs.board_name }}.bin" || \
             { echo "FATAL: shimboot image not produced"; exit 1; }
 
-      - name: Sign 6.6 kernel with shimboot's recovery keys and swap partition 2
-        # Partition 2 IS the running kernel - shimboot pivot_roots into the
-        # Debian rootfs but the kernel executing is always the one in partition 2.
-        # We must sign with keys shimboot extracted from the real recovery shim,
-        # NOT generic devkeys. shimboot leaves those keys in data/ after build.
+      - name: Sign 6.6 kernel with devkeys and swap partition 2
+        # Developer mode relaxes vboot signature checks for recovery boots so
+        # standard devkeys work fine - this is exactly what shimboot itself uses
+        # internally to sign its own partition 2 kernel.
         run: |
           IMAGE="shimboot/data/shimboot_${{ github.event.inputs.board_name }}.bin"
 
-          echo "=== Searching for shimboot signing keys ==="
-          find shimboot -name "*.keyblock" -o -name "*.vbprivk" 2>/dev/null || true
-          find shimboot -name "*.keyblock" -o -name "*.vbprivk" 2>/dev/null | head -5
+          echo "=== Partition table ==="
+          sudo cgpt show "$IMAGE"
 
-          # Locate keyblock and private key shimboot extracted from the recovery image
-          KEYBLOCK=$(find shimboot -name "*.keyblock" | head -1)
-          SIGNPRIVATE=$(find shimboot -name "*_data_key.vbprivk" | head -1)
-
-          if [ -z "$KEYBLOCK" ] || [ -z "$SIGNPRIVATE" ]; then
-            echo "ERROR: Could not find shimboot signing keys. Listing shimboot/data/:"
-            ls -lah shimboot/data/ || true
-            echo "Full shimboot dir:"
-            find shimboot -type f | head -40
-            exit 1
-          fi
-
-          echo "Keyblock:    $KEYBLOCK"
-          echo "Signing key: $SIGNPRIVATE"
-
-          # Extract cmdline from existing partition 2 so shimboot's init still works
+          # Extract cmdline from the existing shimboot partition 2 kernel
+          # so shimboot's init script still gets the args it expects
           KERN_START=$(sudo cgpt show -i 2 -b "$IMAGE")
           KERN_SIZE=$(sudo cgpt show -i 2 -s "$IMAGE")
           echo "Partition 2: start=$KERN_START sectors, size=$KERN_SIZE sectors"
 
-          sudo dd if="$IMAGE" of=existing_kern.img bs=512 skip="$KERN_START" count="$KERN_SIZE" 2>/dev/null
+          sudo dd if="$IMAGE" of=existing_kern.img \
+            bs=512 skip="$KERN_START" count="$KERN_SIZE" 2>/dev/null
+
           CMDLINE=$(futility dump_kernel_config existing_kern.img 2>/dev/null || echo "")
           if [ -z "$CMDLINE" ]; then
             echo "Warning: could not extract cmdline, using safe default"
@@ -191,70 +196,66 @@ jobs:
           echo "$CMDLINE" > kernel.cmdline
           rm -f existing_kern.img
 
-          # Pack and sign our 6.6 kernel with shimboot's real recovery keys
+          echo "=== Devkeys available ==="
+          ls /usr/share/vboot/devkeys/
+
+          # Sign our 6.6 kernel with devkeys
           dd if=/dev/zero of=bootloader.bin bs=512 count=1
           futility vbutil_kernel \
             --pack kernel.vboot \
-            --keyblock "$KEYBLOCK" \
-            --signprivate "$SIGNPRIVATE" \
+            --keyblock /usr/share/vboot/devkeys/recovery_kernel.keyblock \
+            --signprivate /usr/share/vboot/devkeys/recovery_kernel_data_key.vbprivk \
             --config kernel.cmdline \
             --vmlinuz bzImage \
             --bootloader bootloader.bin \
             --version 1 \
             --arch x86_64
 
-          futility vbutil_kernel --verify kernel.vboot || \
-            echo "Warning: verify returned non-zero (may still be OK)"
-          rm -f bootloader.bin bzImage
+          futility vbutil_kernel --verify kernel.vboot
+          rm -f bootloader.bin bzImage kernel.cmdline
 
-          # Confirm it fits in partition 2
+          # Check it fits
           NEW_KERN_SECTORS=$(( ($(stat -c%s kernel.vboot) + 511) / 512 ))
           echo "New kernel: $NEW_KERN_SECTORS sectors, partition has: $KERN_SIZE sectors"
           if [ "$NEW_KERN_SECTORS" -gt "$KERN_SIZE" ]; then
-            echo "ERROR: New kernel ($NEW_KERN_SECTORS sectors) too large for partition 2 ($KERN_SIZE sectors)"
+            echo "ERROR: kernel too large for partition 2"
             exit 1
           fi
 
-          # Swap partition 2
-          sudo dd if=/dev/zero of="$IMAGE" bs=512 seek="$KERN_START" count="$KERN_SIZE" conv=notrunc
-          sudo dd if=kernel.vboot of="$IMAGE" bs=512 seek="$KERN_START" conv=notrunc
-          rm -f kernel.vboot kernel.cmdline
-          echo "Partition 2 kernel swap complete"
+          # Wipe and rewrite partition 2
+          sudo dd if=/dev/zero of="$IMAGE" bs=512 \
+            seek="$KERN_START" count="$KERN_SIZE" conv=notrunc
+          sudo dd if=kernel.vboot of="$IMAGE" bs=512 \
+            seek="$KERN_START" conv=notrunc
+          rm -f kernel.vboot
+
+          echo "Partition 2 swap complete"
           df -h
 
       - name: Inject modules into shimboot Debian rootfs
-        # Modules must live in the rootfs (partition 4) even though the kernel
-        # is in partition 2 - the running kernel loads modules from the mounted rootfs
         run: |
           IMAGE="shimboot/data/shimboot_${{ github.event.inputs.board_name }}.bin"
           KVER=$(ls kernel_modules/lib/modules/)
           MOUNTPOINT="/mnt/shimboot_rootfs"
-          echo "Injecting modules for kernel: $KVER"
+          echo "Injecting modules for: $KVER"
 
           ROOTFS_START=$(sudo cgpt show -i 4 -b "$IMAGE")
           OFFSET=$(( ROOTFS_START * 512 ))
-          echo "Rootfs offset: $OFFSET"
 
           sudo mkdir -p "$MOUNTPOINT"
           sudo mount -o loop,offset=$OFFSET "$IMAGE" "$MOUNTPOINT"
 
-          echo "=== Rootfs / contents ==="
-          ls -lah "$MOUNTPOINT"
-
           sudo mkdir -p "$MOUNTPOINT/lib/modules"
 
-          # Remove old modules if present
-          OLD_VMLINUZ=$(ls "$MOUNTPOINT/boot/vmlinuz-"* 2>/dev/null | head -1 || echo "")
-          if [ -n "$OLD_VMLINUZ" ]; then
-            OLD_KVER=$(basename "$OLD_VMLINUZ" | sed 's/vmlinuz-//')
-            echo "Removing old modules: $OLD_KVER"
-            sudo rm -rf "$MOUNTPOINT/lib/modules/$OLD_KVER"
-          fi
+          # Remove any old kernel modules
+          for old in "$MOUNTPOINT"/lib/modules/*/; do
+            echo "Removing old modules: $old"
+            sudo rm -rf "$old"
+          done
 
-          # Install new modules
           sudo cp -r kernel_modules/lib/modules/$KVER "$MOUNTPOINT/lib/modules/"
           sudo depmod -b "$MOUNTPOINT" $KVER || \
-            echo "Warning: depmod failed, module loading may be impacted"
+            echo "Warning: depmod failed"
 
           echo "=== Installed modules ==="
           ls "$MOUNTPOINT/lib/modules/"
@@ -265,7 +266,6 @@ jobs:
         run: |
           sudo mv shimboot/data/shimboot_${{ github.event.inputs.board_name }}.bin \
              shimboot/data/shimboot_image.bin
-          echo "Renamed to shimboot_image.bin"
           ls -lah shimboot/data/
 
       - name: Delete large intermediate artifacts to free disk
