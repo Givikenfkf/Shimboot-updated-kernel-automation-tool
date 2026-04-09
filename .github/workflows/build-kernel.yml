@@ -116,15 +116,22 @@ jobs:
           ./scripts/config --enable CONFIG_USB_XHCI_HCD
           make olddefconfig
 
-      - name: Build kernel
+      - name: Build kernel and modules
         working-directory: kernel
-        run: make -j2 bzImage 2>&1 | tail -20
+        # Build both bzImage and all modules - the original skipped modules
+        # which would mean no WiFi, display, audio drivers at runtime
+        run: |
+          make -j$(nproc) bzImage modules 2>&1 | tail -20
 
-      - name: Save bzImage and delete kernel source
+      - name: Save kernel artifacts and delete source
         run: |
           cp kernel/arch/x86/boot/bzImage ./bzImage
           cp kernel/.config ./kernel.config
+          # Stage modules into a local directory for later injection
+          sudo make -C kernel INSTALL_MOD_PATH=$(pwd)/kernel_modules modules_install
           rm -rf kernel
+          echo "Kernel version directory:"
+          ls kernel_modules/lib/modules/
           echo "=== Disk after kernel source deletion ==="
           df -h
 
@@ -133,6 +140,10 @@ jobs:
 
       - name: Build shimboot image
         working-directory: shimboot
+        # Let shimboot handle ALL signing using keys extracted from the real
+        # recovery shim image. Do NOT attempt to sign or swap the kernel
+        # partition manually - the firmware validates against device-specific
+        # keys baked into the shim that we cannot replicate.
         run: |
           sudo ./build_complete.sh "${{ github.event.inputs.board_name }}" \
             desktop="${{ github.event.inputs.desktop }}" \
@@ -145,6 +156,60 @@ jobs:
           test -f "data/shimboot_${{ github.event.inputs.board_name }}.bin" || \
             { echo "FATAL: shimboot image not produced"; exit 1; }
 
+      - name: Inject ChromeOS 6.6 kernel into shimboot rootfs
+        run: |
+          IMAGE="shimboot/data/shimboot_${{ github.event.inputs.board_name }}.bin"
+          KVER=$(ls kernel_modules/lib/modules/)
+          echo "Injecting kernel version: $KVER"
+
+          echo "=== Full partition table ==="
+          sudo cgpt show "$IMAGE"
+
+          # shimboot layout: partition 1 = stateful, 2 = kern, 3 = rootfs (Debian)
+          # Confirm partition 3 is the Linux rootfs before mounting
+          ROOTFS_PART=3
+          ROOTFS_START=$(sudo cgpt show -i $ROOTFS_PART -b "$IMAGE")
+          ROOTFS_SIZE=$(sudo cgpt show -i $ROOTFS_PART -s "$IMAGE")
+          OFFSET=$(( ROOTFS_START * 512 ))
+          echo "Rootfs partition: start=$ROOTFS_START sectors, size=$ROOTFS_SIZE sectors, offset=$OFFSET bytes"
+
+          mkdir -p /mnt/shimboot_rootfs
+          sudo mount -o loop,offset=$OFFSET "$IMAGE" /mnt/shimboot_rootfs
+
+          echo "=== Rootfs /boot before injection ==="
+          ls -lah /mnt/shimboot_rootfs/boot/ || echo "No /boot yet"
+
+          # Find what kernel shimboot installed so we can replace it
+          OLD_VMLINUZ=$(ls /mnt/shimboot_rootfs/boot/vmlinuz-* 2>/dev/null | head -1 || echo "")
+          if [ -n "$OLD_VMLINUZ" ]; then
+            OLD_KVER=$(basename "$OLD_VMLINUZ" | sed 's/vmlinuz-//')
+            echo "Replacing existing kernel: $OLD_KVER"
+            sudo rm -f /mnt/shimboot_rootfs/boot/vmlinuz-$OLD_KVER
+            sudo rm -f /mnt/shimboot_rootfs/boot/System.map-$OLD_KVER
+            sudo rm -rf /mnt/shimboot_rootfs/lib/modules/$OLD_KVER
+          fi
+
+          # Install new kernel image
+          sudo cp bzImage /mnt/shimboot_rootfs/boot/vmlinuz-$KVER
+
+          # Install modules (required for WiFi, display, audio, USB, etc.)
+          sudo mkdir -p /mnt/shimboot_rootfs/lib/modules
+          sudo cp -r kernel_modules/lib/modules/$KVER /mnt/shimboot_rootfs/lib/modules/
+
+          # Regenerate module dependency maps
+          sudo depmod -b /mnt/shimboot_rootfs $KVER || \
+            echo "Warning: depmod failed, module loading may be impacted"
+
+          # Update /boot symlinks shimboot's init may follow
+          sudo ln -sf vmlinuz-$KVER /mnt/shimboot_rootfs/boot/vmlinuz || true
+
+          echo "=== Rootfs /boot after injection ==="
+          ls -lah /mnt/shimboot_rootfs/boot/
+          echo "=== Installed modules ==="
+          ls /mnt/shimboot_rootfs/lib/modules/
+
+          sudo umount /mnt/shimboot_rootfs
+
       - name: Rename image
         run: |
           sudo mv shimboot/data/shimboot_${{ github.event.inputs.board_name }}.bin \
@@ -152,88 +217,15 @@ jobs:
           echo "Renamed to shimboot_image.bin"
           ls -lah shimboot/data/
 
-      - name: Delete large build artifacts to free disk
+      - name: Delete large intermediate artifacts to free disk
         run: |
           sudo rm -rf \
             shimboot/data/reco_${{ github.event.inputs.board_name }}.bin \
             shimboot/data/shim_${{ github.event.inputs.board_name }}.bin \
-            shimboot/data/rootfs_${{ github.event.inputs.board_name }}
+            shimboot/data/rootfs_${{ github.event.inputs.board_name }} \
+            kernel_modules
           echo "=== Disk after cleanup ==="
           df -h
-
-      - name: Extract cmdline from shimboot image kernel
-        run: |
-          IMAGE="shimboot/data/shimboot_image.bin"
-          KERN_START=$(sudo cgpt show -i 2 -b "$IMAGE")
-          KERN_SIZE=$(sudo cgpt show -i 2 -s "$IMAGE")
-          sudo dd if="$IMAGE" of=shim_kernel.img bs=512 skip="$KERN_START" count="$KERN_SIZE"
-
-          CMDLINE=$(futility dump_kernel_config shim_kernel.img 2>/dev/null || echo "")
-          if [ -z "$CMDLINE" ]; then
-            echo "Warning: could not extract cmdline, using safe default"
-            CMDLINE="console=tty1 init=/sbin/init rootwait ro"
-          fi
-          echo "Cmdline: $CMDLINE"
-          echo "$CMDLINE" > kernel.cmdline
-          rm -f shim_kernel.img
-
-      - name: Get vboot signing keys
-        run: |
-          if [ ! -d "/usr/share/vboot/devkeys" ]; then
-            git clone --depth=1 \
-              https://chromium.googlesource.com/chromiumos/platform/vboot_reference \
-              vboot_reference
-            cd vboot_reference && make -j2
-            sudo mkdir -p /usr/share/vboot/devkeys
-            sudo cp tests/devkeys/* /usr/share/vboot/devkeys/
-            cd ..
-            rm -rf vboot_reference
-          fi
-
-      - name: Sign kernel
-        run: |
-          dd if=/dev/zero of=bootloader.bin bs=512 count=1
-          futility vbutil_kernel \
-            --pack kernel.vboot \
-            --keyblock /usr/share/vboot/devkeys/recovery_kernel.keyblock \
-            --signprivate /usr/share/vboot/devkeys/recovery_kernel_data_key.vbprivk \
-            --config kernel.cmdline \
-            --vmlinuz bzImage \
-            --bootloader bootloader.bin \
-            --version 1 \
-            --arch x86_64
-          futility vbutil_kernel --verify kernel.vboot
-          rm -f bzImage bootloader.bin
-          ls -lh kernel.vboot
-          df -h
-
-      - name: Swap kernel partition
-        run: |
-          IMAGE="shimboot/data/shimboot_image.bin"
-
-          echo "=== Image partition table ==="
-          sudo cgpt show "$IMAGE"
-
-          KERN_START=$(sudo cgpt show -i 2 -b "$IMAGE")
-          KERN_SIZE=$(sudo cgpt show -i 2 -s "$IMAGE")
-          echo "Kernel partition: start=$KERN_START sectors, size=$KERN_SIZE sectors"
-
-          NEW_KERN_SECTORS=$(( ($(stat -c%s kernel.vboot) + 511) / 512 ))
-          echo "New kernel needs: $NEW_KERN_SECTORS sectors, partition has: $KERN_SIZE sectors"
-
-          if [ "$NEW_KERN_SECTORS" -gt "$KERN_SIZE" ]; then
-            echo "ERROR: New kernel ($NEW_KERN_SECTORS sectors) is larger than partition ($KERN_SIZE sectors)"
-            exit 1
-          fi
-
-          sudo dd if=/dev/zero of="$IMAGE" bs=512 seek="$KERN_START" count="$KERN_SIZE" conv=notrunc
-          sudo dd if=kernel.vboot of="$IMAGE" bs=512 seek="$KERN_START" conv=notrunc
-
-          sudo dd if="$IMAGE" of=verify_kernel.img bs=512 skip="$KERN_START" count="$KERN_SIZE"
-          futility vbutil_kernel --verify verify_kernel.img && \
-            echo "Kernel swap verified OK" || \
-            echo "Warning: verification returned non-zero"
-          rm -f verify_kernel.img
 
       - name: Zip final image
         run: |
