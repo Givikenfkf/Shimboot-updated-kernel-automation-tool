@@ -164,9 +164,9 @@ jobs:
       - name: Extract cmdline from shimboot image kernel
         run: |
           IMAGE="shimboot/data/shimboot_image.bin"
-          KERN_START=$(cgpt show -i 2 -b "$IMAGE")
-          KERN_SIZE=$(cgpt show -i 2 -s "$IMAGE")
-          dd if="$IMAGE" of=shim_kernel.img bs=512 skip="$KERN_START" count="$KERN_SIZE"
+          KERN_START=$(sudo cgpt show -i 2 -b "$IMAGE")
+          KERN_SIZE=$(sudo cgpt show -i 2 -s "$IMAGE")
+          sudo dd if="$IMAGE" of=shim_kernel.img bs=512 skip="$KERN_START" count="$KERN_SIZE"
 
           CMDLINE=$(futility dump_kernel_config shim_kernel.img 2>/dev/null || echo "")
           if [ -z "$CMDLINE" ]; then
@@ -212,10 +212,10 @@ jobs:
           IMAGE="shimboot/data/shimboot_image.bin"
 
           echo "=== Image partition table ==="
-          cgpt show "$IMAGE"
+          sudo cgpt show "$IMAGE"
 
-          KERN_START=$(cgpt show -i 2 -b "$IMAGE")
-          KERN_SIZE=$(cgpt show -i 2 -s "$IMAGE")
+          KERN_START=$(sudo cgpt show -i 2 -b "$IMAGE")
+          KERN_SIZE=$(sudo cgpt show -i 2 -s "$IMAGE")
           echo "Kernel partition: start=$KERN_START sectors, size=$KERN_SIZE sectors"
 
           NEW_KERN_SECTORS=$(( ($(stat -c%s kernel.vboot) + 511) / 512 ))
@@ -226,10 +226,10 @@ jobs:
             exit 1
           fi
 
-          dd if=/dev/zero of="$IMAGE" bs=512 seek="$KERN_START" count="$KERN_SIZE" conv=notrunc
-          dd if=kernel.vboot of="$IMAGE" bs=512 seek="$KERN_START" conv=notrunc
+          sudo dd if=/dev/zero of="$IMAGE" bs=512 seek="$KERN_START" count="$KERN_SIZE" conv=notrunc
+          sudo dd if=kernel.vboot of="$IMAGE" bs=512 seek="$KERN_START" conv=notrunc
 
-          dd if="$IMAGE" of=verify_kernel.img bs=512 skip="$KERN_START" count="$KERN_SIZE"
+          sudo dd if="$IMAGE" of=verify_kernel.img bs=512 skip="$KERN_START" count="$KERN_SIZE"
           futility vbutil_kernel --verify verify_kernel.img && \
             echo "Kernel swap verified OK" || \
             echo "Warning: verification returned non-zero"
@@ -237,7 +237,7 @@ jobs:
 
       - name: Zip final image
         run: |
-          zip -j shimboot_${{ github.event.inputs.board_name }}_chromeos-6.6.zip \
+          sudo zip -j shimboot_${{ github.event.inputs.board_name }}_chromeos-6.6.zip \
             shimboot/data/shimboot_image.bin
           ls -lh shimboot_${{ github.event.inputs.board_name }}_chromeos-6.6.zip
 
