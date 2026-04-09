@@ -114,6 +114,11 @@ jobs:
           ./scripts/config --enable CONFIG_SND_HDA_CODEC_HDMI
           ./scripts/config --enable CONFIG_USB_SUPPORT
           ./scripts/config --enable CONFIG_USB_XHCI_HCD
+          # Initramfs decompression support — required by update-initramfs
+          ./scripts/config --enable CONFIG_RD_GZIP
+          ./scripts/config --enable CONFIG_RD_ZSTD
+          ./scripts/config --enable CONFIG_RD_LZ4
+          ./scripts/config --enable CONFIG_RD_XZ
           make olddefconfig
 
       - name: Build kernel and modules
@@ -213,6 +218,9 @@ jobs:
 
           sudo mkdir -p "$MOUNTPOINT"
           sudo mount -o loop,offset=$OFFSET "$IMAGE" "$MOUNTPOINT"
+
+          # Copy kernel config so update-initramfs can detect compression support
+          sudo cp kernel.config "$MOUNTPOINT/boot/config-$KVER"
 
           # Mount pseudo filesystems needed for chroot
           sudo mount --bind /proc "$MOUNTPOINT/proc"
