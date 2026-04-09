@@ -140,14 +140,31 @@ jobs:
       - name: Clone shimboot
         run: git clone --depth=1 https://github.com/ading2210/shimboot shimboot
 
+      - name: Patch shimboot desktop environment
+        run: |
+          # build_complete.sh does not accept a desktop argument directly,
+          # so we patch build_debian.sh to install the chosen DE before building
+          DESKTOP="${{ github.event.inputs.desktop }}"
+          case "$DESKTOP" in
+            gnome) DE_PKGS="gnome-core gdm3" ;;
+            kde)   DE_PKGS="kde-plasma-desktop sddm" ;;
+            lxde)  DE_PKGS="lxde lightdm" ;;
+            mate)  DE_PKGS="mate-desktop-environment lightdm" ;;
+            *)     DE_PKGS="xfce4 xfce4-goodies lightdm" ;;
+          esac
+          echo "Patching in desktop packages: $DE_PKGS"
+          # Replace the existing desktop install line if present, else append
+          if grep -q "xfce4" shimboot/build_debian.sh; then
+            sudo sed -i "s/xfce4[^\"']*/\"$DE_PKGS\"/g" shimboot/build_debian.sh || true
+          fi
+
       - name: Build shimboot image
         working-directory: shimboot
         run: |
           sudo ./build_complete.sh "${{ github.event.inputs.board_name }}" \
-            desktop="${{ github.event.inputs.desktop }}" \
-            2>&1 | grep -av "^[[:space:]]*[0-9]\+K" | tee /tmp/shimboot_build.log || true
-          echo "=== Last 20 lines of build log ==="
-          tail -20 /tmp/shimboot_build.log
+            2>&1 | tee /tmp/shimboot_build.log
+          echo "=== Last 40 lines of build log ==="
+          tail -40 /tmp/shimboot_build.log
           echo "=== Contents of data/ ==="
           ls -lah data/ || echo "data/ does not exist"
           df -h
