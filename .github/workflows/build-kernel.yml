@@ -71,7 +71,6 @@ jobs:
           else
             make x86_64_defconfig
           fi
-
           [ -f "chromeos/scripts/prepareconfig" ] && \
             bash chromeos/scripts/prepareconfig chromiumos-x86_64 || true
 
@@ -84,23 +83,43 @@ jobs:
           ./scripts/config --enable CONFIG_ZSWAP
           ./scripts/config --enable CONFIG_ZRAM
           ./scripts/config --enable CONFIG_CGROUPS
+          ./scripts/config --enable CONFIG_CGROUP_BPF
+          ./scripts/config --enable CONFIG_MEMCG
+          ./scripts/config --enable CONFIG_CGROUP_DEVICE
+          ./scripts/config --enable CONFIG_CGROUP_CPUACCT
+          ./scripts/config --enable CONFIG_CGROUP_PIDS
+          ./scripts/config --enable CONFIG_CGROUP_FREEZER
+          ./scripts/config --enable CONFIG_IO_URING
           ./scripts/config --enable CONFIG_NAMESPACES
           ./scripts/config --enable CONFIG_USER_NS
+          ./scripts/config --enable CONFIG_PID_NS
+          ./scripts/config --enable CONFIG_NET_NS
+          ./scripts/config --enable CONFIG_UTS_NS
+          ./scripts/config --enable CONFIG_IPC_NS
           ./scripts/config --enable CONFIG_BPF
+          ./scripts/config --enable CONFIG_BPF_SYSCALL
           ./scripts/config --enable CONFIG_EXT4_FS
+          ./scripts/config --enable CONFIG_BTRFS_FS
           ./scripts/config --enable CONFIG_TMPFS
+          ./scripts/config --enable CONFIG_TMPFS_POSIX_ACL
           ./scripts/config --enable CONFIG_MMC
+          ./scripts/config --enable CONFIG_MMC_SDHCI
+          ./scripts/config --enable CONFIG_MMC_SDHCI_ACPI
+          ./scripts/config --enable CONFIG_MMC_SDHCI_PCI
           ./scripts/config --enable CONFIG_IWLWIFI
+          ./scripts/config --enable CONFIG_IWLMVM
+          ./scripts/config --enable CONFIG_DRM
           ./scripts/config --enable CONFIG_DRM_I915
           ./scripts/config --enable CONFIG_SND_HDA_INTEL
+          ./scripts/config --enable CONFIG_SND_HDA_CODEC_HDMI
+          ./scripts/config --enable CONFIG_USB_SUPPORT
           ./scripts/config --enable CONFIG_USB_XHCI_HCD
-
           make olddefconfig
 
       - name: Build kernel and modules
         working-directory: kernel
         run: |
-          make -j$(nproc) bzImage modules
+          make -j$(nproc) bzImage modules 2>&1 | tail -20
 
       - name: Save kernel artifacts and delete source
         run: |
@@ -108,9 +127,10 @@ jobs:
           cp kernel/.config ./kernel.config
           sudo make -C kernel INSTALL_MOD_PATH=$(pwd)/kernel_modules modules_install
           rm -rf kernel
-
-          echo "Kernel version:"
+          echo "Kernel version directory:"
           ls kernel_modules/lib/modules/
+          echo "=== Disk after kernel source deletion ==="
+          df -h
 
       - name: Clone shimboot
         run: git clone --depth=1 https://github.com/ading2210/shimboot shimboot
@@ -119,88 +139,103 @@ jobs:
         working-directory: shimboot
         run: |
           sudo ./build_complete.sh "${{ github.event.inputs.board_name }}" \
-            desktop="${{ github.event.inputs.desktop }}"
-
+            desktop="${{ github.event.inputs.desktop }}" \
+            2>&1 | grep -av "^[[:space:]]*[0-9]\+K" | tee /tmp/shimboot_build.log || true
+          echo "=== Last 20 lines of build log ==="
+          tail -20 /tmp/shimboot_build.log
+          echo "=== Contents of data/ ==="
+          ls -lah data/ || echo "data/ does not exist"
+          df -h
           test -f "data/shimboot_${{ github.event.inputs.board_name }}.bin" || \
             { echo "FATAL: shimboot image not produced"; exit 1; }
 
       - name: Inject ChromeOS 6.6 kernel into shimboot rootfs
         run: |
-          set -e
-
           IMAGE="shimboot/data/shimboot_${{ github.event.inputs.board_name }}.bin"
           KVER=$(ls kernel_modules/lib/modules/)
+          MOUNTPOINT="/mnt/shimboot_rootfs"
           echo "Injecting kernel version: $KVER"
 
-          echo "=== Partition table ==="
+          echo "=== Full partition table ==="
           sudo cgpt show "$IMAGE"
 
-          ROOTFS_PART=3
-          ROOTFS_START=$(sudo cgpt show -i $ROOTFS_PART -b "$IMAGE")
+          # Partition 4 is the Debian rootfs (shimboot_rootfs:debian)
+          ROOTFS_START=$(sudo cgpt show -i 4 -b "$IMAGE")
           OFFSET=$(( ROOTFS_START * 512 ))
-
           echo "Rootfs offset: $OFFSET"
 
-          # ✅ FIX: use local mount dir instead of /mnt
-          MNT_DIR="$PWD/mnt_rootfs"
-          mkdir -p "$MNT_DIR"
+          sudo mkdir -p "$MOUNTPOINT"
+          sudo mount -o loop,offset=$OFFSET "$IMAGE" "$MOUNTPOINT"
 
-          sudo mount -o loop,offset=$OFFSET "$IMAGE" "$MNT_DIR"
+          echo "=== Rootfs / contents ==="
+          ls -lah "$MOUNTPOINT"
 
-          echo "=== /boot before ==="
-          ls -lah "$MNT_DIR/boot/" || true
+          # Create /boot and /lib/modules in case shimboot didn't pre-create them
+          sudo mkdir -p "$MOUNTPOINT/boot"
+          sudo mkdir -p "$MOUNTPOINT/lib/modules"
 
-          OLD_VMLINUZ=$(ls "$MNT_DIR"/boot/vmlinuz-* 2>/dev/null | head -1 || true)
+          echo "=== /boot before injection ==="
+          ls -lah "$MOUNTPOINT/boot/" || echo "(empty)"
 
+          # Remove old kernel if one was installed by shimboot
+          OLD_VMLINUZ=$(ls "$MOUNTPOINT/boot/vmlinuz-"* 2>/dev/null | head -1 || echo "")
           if [ -n "$OLD_VMLINUZ" ]; then
             OLD_KVER=$(basename "$OLD_VMLINUZ" | sed 's/vmlinuz-//')
-            echo "Removing old kernel: $OLD_KVER"
-
-            sudo rm -f "$MNT_DIR/boot/vmlinuz-$OLD_KVER"
-            sudo rm -f "$MNT_DIR/boot/System.map-$OLD_KVER"
-            sudo rm -rf "$MNT_DIR/lib/modules/$OLD_KVER"
+            echo "Replacing existing kernel: $OLD_KVER"
+            sudo rm -f "$MOUNTPOINT/boot/vmlinuz-$OLD_KVER"
+            sudo rm -f "$MOUNTPOINT/boot/System.map-$OLD_KVER"
+            sudo rm -rf "$MOUNTPOINT/lib/modules/$OLD_KVER"
           fi
 
-          sudo cp bzImage "$MNT_DIR/boot/vmlinuz-$KVER"
+          # Install new kernel and modules
+          sudo cp bzImage "$MOUNTPOINT/boot/vmlinuz-$KVER"
+          sudo cp -r kernel_modules/lib/modules/$KVER "$MOUNTPOINT/lib/modules/"
+          sudo depmod -b "$MOUNTPOINT" $KVER || \
+            echo "Warning: depmod failed, module loading may be impacted"
+          sudo ln -sf "vmlinuz-$KVER" "$MOUNTPOINT/boot/vmlinuz" || true
 
-          sudo mkdir -p "$MNT_DIR/lib/modules"
-          sudo cp -r kernel_modules/lib/modules/$KVER "$MNT_DIR/lib/modules/"
+          echo "=== /boot after injection ==="
+          ls -lah "$MOUNTPOINT/boot/"
+          echo "=== Installed modules ==="
+          ls "$MOUNTPOINT/lib/modules/"
 
-          sudo depmod -b "$MNT_DIR" $KVER || true
-
-          sudo ln -sf "vmlinuz-$KVER" "$MNT_DIR/boot/vmlinuz" || true
-
-          echo "=== /boot after ==="
-          ls -lah "$MNT_DIR/boot/"
-
-          sudo umount "$MNT_DIR"
+          sudo umount "$MOUNTPOINT"
 
       - name: Rename image
         run: |
-          mv shimboot/data/shimboot_${{ github.event.inputs.board_name }}.bin \
+          sudo mv shimboot/data/shimboot_${{ github.event.inputs.board_name }}.bin \
              shimboot/data/shimboot_image.bin
+          echo "Renamed to shimboot_image.bin"
+          ls -lah shimboot/data/
 
-      - name: Cleanup
+      - name: Delete large intermediate artifacts to free disk
         run: |
           sudo rm -rf \
-            shimboot/data/reco_* \
-            shimboot/data/shim_* \
-            shimboot/data/rootfs_* \
+            shimboot/data/reco_${{ github.event.inputs.board_name }}.bin \
+            shimboot/data/shim_${{ github.event.inputs.board_name }}.bin \
+            shimboot/data/rootfs_${{ github.event.inputs.board_name }} \
             kernel_modules
+          echo "=== Disk after cleanup ==="
+          df -h
 
       - name: Zip final image
         run: |
-          zip -j shimboot_${{ github.event.inputs.board_name }}_chromeos-6.6.zip \
+          sudo zip -j shimboot_${{ github.event.inputs.board_name }}_chromeos-6.6.zip \
             shimboot/data/shimboot_image.bin
+          ls -lh shimboot_${{ github.event.inputs.board_name }}_chromeos-6.6.zip
 
-      - name: Upload image
+      - name: Upload bootable shimboot image
         uses: actions/upload-artifact@v4
         with:
           name: shimboot-${{ github.event.inputs.board_name }}-chromeos-6.6
           path: shimboot_${{ github.event.inputs.board_name }}_chromeos-6.6.zip
+          retention-days: 30
+          if-no-files-found: error
 
       - name: Upload kernel config
         uses: actions/upload-artifact@v4
         with:
           name: kernel-config
           path: kernel.config
+          retention-days: 30
+          if-no-files-found: error
