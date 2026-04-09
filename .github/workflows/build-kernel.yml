@@ -81,10 +81,25 @@ jobs:
             make x86_64_defconfig
           fi
           [ -f "chromeos/scripts/prepareconfig" ] && bash chromeos/scripts/prepareconfig chromiumos-x86_64 || true
-          # Enable essential features
+
+          # Essential ChromeOS boot options (must be built-in)
+          ./scripts/config --enable CONFIG_CHROMEOS_PLATFORM
+          ./scripts/config --enable CONFIG_CHROMEOS_LAPTOP
+          ./scripts/config --enable CONFIG_CHROMEOS_VBT
+          ./scripts/config --enable CONFIG_CHROMEOS_PSTORE
+          ./scripts/config --enable CONFIG_CHROMEOS_RAMOOPS
+          ./scripts/config --enable CONFIG_CHROMEOS_TBMC
+          ./scripts/config --enable CONFIG_EFI
+          ./scripts/config --enable CONFIG_EFI_VARS
+          ./scripts/config --enable CONFIG_EFI_ESRT
+          ./scripts/config --set-val CONFIG_CMDLINE_BOOL y
+          ./scripts/config --set-str CONFIG_CMDLINE "console=tty1 init=/sbin/init rootwait ro"
+
+          # Enable filesystems and features
           ./scripts/config --enable CONFIG_OVERLAY_FS
           ./scripts/config --enable CONFIG_SQUASHFS
           ./scripts/config --enable CONFIG_SQUASHFS_XZ
+          ./scripts/config --enable CONFIG_SQUASHFS_LZ4
           ./scripts/config --enable CONFIG_SWAP
           ./scripts/config --enable CONFIG_ZSWAP
           ./scripts/config --enable CONFIG_ZRAM
@@ -96,6 +111,7 @@ jobs:
           ./scripts/config --enable CONFIG_IWLWIFI
           ./scripts/config --enable CONFIG_DRM_I915
           ./scripts/config --enable CONFIG_SND_HDA_INTEL
+
           make olddefconfig
 
       - name: Build kernel and modules
@@ -121,29 +137,27 @@ jobs:
             2>&1 | grep -av "^[[:space:]]*[0-9]\+K" | tee /tmp/shimboot_build.log
           test -f "data/shimboot_${{ github.event.inputs.board_name }}.bin" || exit 1
 
-      - name: Replace kernel partition with custom 6.6 kernel (proper signing)
+      - name: Replace kernel partition with custom 6.6 kernel (fixed signing)
         run: |
           IMAGE="shimboot/data/shimboot_${{ github.event.inputs.board_name }}.bin"
-          # Get partition 2 offsets
           KERN_START=$(sudo cgpt show -i 2 -b "$IMAGE")
           KERN_SIZE=$(sudo cgpt show -i 2 -s "$IMAGE")
           echo "Partition 2: start=$KERN_START sectors, size=$KERN_SIZE sectors"
 
-          # Extract cmdline from the existing shimboot kernel (preserve boot args)
-          sudo dd if="$IMAGE" of=old_kern.img bs=512 skip="$KERN_START" count="$KERN_SIZE" 2>/dev/null
-          CMDLINE=$(futility dump_kernel_config old_kern.img 2>/dev/null | head -n1)
+          # Extract the existing kernel to get its bootloader (which is known to work)
+          sudo dd if="$IMAGE" of=existing_kern.bin bs=512 skip="$KERN_START" count="$KERN_SIZE" 2>/dev/null
+          # Extract bootloader from the existing kernel (first 512 bytes)
+          dd if=existing_kern.bin of=bootloader.bin bs=512 count=1 2>/dev/null
+          # Extract cmdline from existing kernel
+          CMDLINE=$(futility dump_kernel_config existing_kern.bin 2>/dev/null | head -n1)
           if [ -z "$CMDLINE" ]; then
-            # fallback to a working shimboot cmdline
             CMDLINE="console=tty1 init=/sbin/init rootwait ro"
           fi
           echo "Using cmdline: $CMDLINE"
           echo "$CMDLINE" > kernel.cmdline
-          rm -f old_kern.img
+          rm -f existing_kern.bin
 
-          # Create a 512-byte bootloader stub (same as shimboot)
-          dd if=/dev/zero of=bootloader.bin bs=512 count=1 2>/dev/null
-
-          # Sign the new kernel using the exact same command as shimboot's build_complete.sh
+          # Sign the new kernel with --pad to exactly fill the partition
           futility vbutil_kernel \
             --pack kernel.vboot \
             --keyblock /usr/share/vboot/devkeys/recovery_kernel.keyblock \
@@ -152,24 +166,17 @@ jobs:
             --vmlinuz bzImage \
             --bootloader bootloader.bin \
             --version 1 \
-            --arch x86_64
+            --arch x86_64 \
+            --pad $((KERN_SIZE * 512))
 
           # Verify the signed kernel
           futility vbutil_kernel --verify kernel.vboot || { echo "Signing failed"; exit 1; }
 
-          # Check size
-          NEW_SECTORS=$(( ($(stat -c%s kernel.vboot) + 511) / 512 ))
-          if [ $NEW_SECTORS -gt $KERN_SIZE ]; then
-            echo "ERROR: kernel too large ($NEW_SECTORS > $KERN_SIZE sectors)"
-            exit 1
-          fi
-
-          # Write the new kernel
-          sudo dd if=/dev/zero of="$IMAGE" bs=512 seek="$KERN_START" count="$KERN_SIZE" conv=notrunc 2>/dev/null
+          # Write back the new kernel
           sudo dd if=kernel.vboot of="$IMAGE" bs=512 seek="$KERN_START" conv=notrunc 2>/dev/null
 
-          # Set boot flags: priority=1, tries=0, successful=1 (required for ChromeOS vboot)
-          sudo cgpt add -i 2 -P 1 -T 0 -S 1 "$IMAGE"
+          # Set boot flags: priority=1, tries=1, successful=1
+          sudo cgpt add -i 2 -P 1 -T 1 -S 1 "$IMAGE"
 
           # Cleanup
           rm -f kernel.vboot bootloader.bin kernel.cmdline bzImage
@@ -201,7 +208,7 @@ jobs:
           KERN_START=$(sudo cgpt show -i 2 -b "$IMAGE")
           KERN_SIZE=$(sudo cgpt show -i 2 -s "$IMAGE")
           sudo dd if="$IMAGE" of=final_kern.bin bs=512 skip="$KERN_START" count="$KERN_SIZE" 2>/dev/null
-          futility vbutil_kernel --verify final_kern.bin || echo "WARNING: final kernel signature invalid!"
+          futility vbutil_kernel --verify final_kern.bin --verbose || echo "WARNING: final kernel signature invalid!"
           futility dump_kernel_config final_kern.bin
           rm -f final_kern.bin
 
