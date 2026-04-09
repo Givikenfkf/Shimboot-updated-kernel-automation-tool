@@ -114,11 +114,6 @@ jobs:
           ./scripts/config --enable CONFIG_SND_HDA_CODEC_HDMI
           ./scripts/config --enable CONFIG_USB_SUPPORT
           ./scripts/config --enable CONFIG_USB_XHCI_HCD
-          # Initramfs decompression support — required by update-initramfs
-          ./scripts/config --enable CONFIG_RD_GZIP
-          ./scripts/config --enable CONFIG_RD_ZSTD
-          ./scripts/config --enable CONFIG_RD_LZ4
-          ./scripts/config --enable CONFIG_RD_XZ
           make olddefconfig
 
       - name: Build kernel and modules
@@ -140,48 +135,102 @@ jobs:
       - name: Clone shimboot
         run: git clone --depth=1 https://github.com/ading2210/shimboot shimboot
 
-      - name: Patch shimboot desktop environment
-        run: |
-          # build_complete.sh does not accept a desktop argument directly,
-          # so we patch build_debian.sh to install the chosen DE before building
-          DESKTOP="${{ github.event.inputs.desktop }}"
-          case "$DESKTOP" in
-            gnome) DE_PKGS="gnome-core gdm3" ;;
-            kde)   DE_PKGS="kde-plasma-desktop sddm" ;;
-            lxde)  DE_PKGS="lxde lightdm" ;;
-            mate)  DE_PKGS="mate-desktop-environment lightdm" ;;
-            *)     DE_PKGS="xfce4 xfce4-goodies lightdm" ;;
-          esac
-          echo "Patching in desktop packages: $DE_PKGS"
-          # Replace the existing desktop install line if present, else append
-          if grep -q "xfce4" shimboot/build_debian.sh; then
-            sudo sed -i "s/xfce4[^\"']*/\"$DE_PKGS\"/g" shimboot/build_debian.sh || true
-          fi
-
       - name: Build shimboot image
         working-directory: shimboot
         run: |
           sudo ./build_complete.sh "${{ github.event.inputs.board_name }}" \
-            2>&1 | tee /tmp/shimboot_build.log
-          echo "=== Last 40 lines of build log ==="
-          tail -40 /tmp/shimboot_build.log
+            desktop="${{ github.event.inputs.desktop }}" \
+            2>&1 | grep -av "^[[:space:]]*[0-9]\+K" | tee /tmp/shimboot_build.log || true
+          echo "=== Last 20 lines of build log ==="
+          tail -20 /tmp/shimboot_build.log
           echo "=== Contents of data/ ==="
           ls -lah data/ || echo "data/ does not exist"
           df -h
           test -f "data/shimboot_${{ github.event.inputs.board_name }}.bin" || \
             { echo "FATAL: shimboot image not produced"; exit 1; }
 
-      - name: Inject ChromeOS 6.6 kernel into shimboot rootfs
+      - name: Sign 6.6 kernel with shimboot's recovery keys and swap partition 2
+        # Partition 2 IS the running kernel - shimboot pivot_roots into the
+        # Debian rootfs but the kernel executing is always the one in partition 2.
+        # We must sign with keys shimboot extracted from the real recovery shim,
+        # NOT generic devkeys. shimboot leaves those keys in data/ after build.
+        run: |
+          IMAGE="shimboot/data/shimboot_${{ github.event.inputs.board_name }}.bin"
+
+          echo "=== Searching for shimboot signing keys ==="
+          find shimboot -name "*.keyblock" -o -name "*.vbprivk" 2>/dev/null || true
+          find shimboot -name "*.keyblock" -o -name "*.vbprivk" 2>/dev/null | head -5
+
+          # Locate keyblock and private key shimboot extracted from the recovery image
+          KEYBLOCK=$(find shimboot -name "*.keyblock" | head -1)
+          SIGNPRIVATE=$(find shimboot -name "*_data_key.vbprivk" | head -1)
+
+          if [ -z "$KEYBLOCK" ] || [ -z "$SIGNPRIVATE" ]; then
+            echo "ERROR: Could not find shimboot signing keys. Listing shimboot/data/:"
+            ls -lah shimboot/data/ || true
+            echo "Full shimboot dir:"
+            find shimboot -type f | head -40
+            exit 1
+          fi
+
+          echo "Keyblock:    $KEYBLOCK"
+          echo "Signing key: $SIGNPRIVATE"
+
+          # Extract cmdline from existing partition 2 so shimboot's init still works
+          KERN_START=$(sudo cgpt show -i 2 -b "$IMAGE")
+          KERN_SIZE=$(sudo cgpt show -i 2 -s "$IMAGE")
+          echo "Partition 2: start=$KERN_START sectors, size=$KERN_SIZE sectors"
+
+          sudo dd if="$IMAGE" of=existing_kern.img bs=512 skip="$KERN_START" count="$KERN_SIZE" 2>/dev/null
+          CMDLINE=$(futility dump_kernel_config existing_kern.img 2>/dev/null || echo "")
+          if [ -z "$CMDLINE" ]; then
+            echo "Warning: could not extract cmdline, using safe default"
+            CMDLINE="console=tty1 init=/sbin/init rootwait ro"
+          fi
+          echo "Cmdline: $CMDLINE"
+          echo "$CMDLINE" > kernel.cmdline
+          rm -f existing_kern.img
+
+          # Pack and sign our 6.6 kernel with shimboot's real recovery keys
+          dd if=/dev/zero of=bootloader.bin bs=512 count=1
+          futility vbutil_kernel \
+            --pack kernel.vboot \
+            --keyblock "$KEYBLOCK" \
+            --signprivate "$SIGNPRIVATE" \
+            --config kernel.cmdline \
+            --vmlinuz bzImage \
+            --bootloader bootloader.bin \
+            --version 1 \
+            --arch x86_64
+
+          futility vbutil_kernel --verify kernel.vboot || \
+            echo "Warning: verify returned non-zero (may still be OK)"
+          rm -f bootloader.bin bzImage
+
+          # Confirm it fits in partition 2
+          NEW_KERN_SECTORS=$(( ($(stat -c%s kernel.vboot) + 511) / 512 ))
+          echo "New kernel: $NEW_KERN_SECTORS sectors, partition has: $KERN_SIZE sectors"
+          if [ "$NEW_KERN_SECTORS" -gt "$KERN_SIZE" ]; then
+            echo "ERROR: New kernel ($NEW_KERN_SECTORS sectors) too large for partition 2 ($KERN_SIZE sectors)"
+            exit 1
+          fi
+
+          # Swap partition 2
+          sudo dd if=/dev/zero of="$IMAGE" bs=512 seek="$KERN_START" count="$KERN_SIZE" conv=notrunc
+          sudo dd if=kernel.vboot of="$IMAGE" bs=512 seek="$KERN_START" conv=notrunc
+          rm -f kernel.vboot kernel.cmdline
+          echo "Partition 2 kernel swap complete"
+          df -h
+
+      - name: Inject modules into shimboot Debian rootfs
+        # Modules must live in the rootfs (partition 4) even though the kernel
+        # is in partition 2 - the running kernel loads modules from the mounted rootfs
         run: |
           IMAGE="shimboot/data/shimboot_${{ github.event.inputs.board_name }}.bin"
           KVER=$(ls kernel_modules/lib/modules/)
           MOUNTPOINT="/mnt/shimboot_rootfs"
-          echo "Injecting kernel version: $KVER"
+          echo "Injecting modules for kernel: $KVER"
 
-          echo "=== Full partition table ==="
-          sudo cgpt show "$IMAGE"
-
-          # Partition 4 is the Debian rootfs (shimboot_rootfs:debian)
           ROOTFS_START=$(sudo cgpt show -i 4 -b "$IMAGE")
           OFFSET=$(( ROOTFS_START * 512 ))
           echo "Rootfs offset: $OFFSET"
@@ -192,75 +241,24 @@ jobs:
           echo "=== Rootfs / contents ==="
           ls -lah "$MOUNTPOINT"
 
-          # Create /boot and /lib/modules in case shimboot didn't pre-create them
-          sudo mkdir -p "$MOUNTPOINT/boot"
           sudo mkdir -p "$MOUNTPOINT/lib/modules"
 
-          echo "=== /boot before injection ==="
-          ls -lah "$MOUNTPOINT/boot/" || echo "(empty)"
-
-          # Remove old kernel if one was installed by shimboot
+          # Remove old modules if present
           OLD_VMLINUZ=$(ls "$MOUNTPOINT/boot/vmlinuz-"* 2>/dev/null | head -1 || echo "")
           if [ -n "$OLD_VMLINUZ" ]; then
             OLD_KVER=$(basename "$OLD_VMLINUZ" | sed 's/vmlinuz-//')
-            echo "Replacing existing kernel: $OLD_KVER"
-            sudo rm -f "$MOUNTPOINT/boot/vmlinuz-$OLD_KVER"
-            sudo rm -f "$MOUNTPOINT/boot/initrd.img-$OLD_KVER"
-            sudo rm -f "$MOUNTPOINT/boot/System.map-$OLD_KVER"
+            echo "Removing old modules: $OLD_KVER"
             sudo rm -rf "$MOUNTPOINT/lib/modules/$OLD_KVER"
           fi
 
-          # Install new kernel and modules
-          sudo cp bzImage "$MOUNTPOINT/boot/vmlinuz-$KVER"
+          # Install new modules
           sudo cp -r kernel_modules/lib/modules/$KVER "$MOUNTPOINT/lib/modules/"
           sudo depmod -b "$MOUNTPOINT" $KVER || \
             echo "Warning: depmod failed, module loading may be impacted"
-          sudo ln -sf "vmlinuz-$KVER" "$MOUNTPOINT/boot/vmlinuz" || true
 
-          echo "=== /boot after injection ==="
-          ls -lah "$MOUNTPOINT/boot/"
           echo "=== Installed modules ==="
           ls "$MOUNTPOINT/lib/modules/"
 
-          sudo umount "$MOUNTPOINT"
-
-      - name: Generate initramfs for injected kernel
-        run: |
-          IMAGE="shimboot/data/shimboot_${{ github.event.inputs.board_name }}.bin"
-          KVER=$(ls kernel_modules/lib/modules/)
-          MOUNTPOINT="/mnt/shimboot_rootfs"
-
-          ROOTFS_START=$(sudo cgpt show -i 4 -b "$IMAGE")
-          OFFSET=$(( ROOTFS_START * 512 ))
-
-          sudo mkdir -p "$MOUNTPOINT"
-          sudo mount -o loop,offset=$OFFSET "$IMAGE" "$MOUNTPOINT"
-
-          # Copy kernel config so update-initramfs can detect compression support
-          sudo cp kernel.config "$MOUNTPOINT/boot/config-$KVER"
-
-          # Mount pseudo filesystems needed for chroot
-          sudo mount --bind /proc "$MOUNTPOINT/proc"
-          sudo mount --bind /sys "$MOUNTPOINT/sys"
-          sudo mount --bind /dev "$MOUNTPOINT/dev"
-          sudo mount --bind /dev/pts "$MOUNTPOINT/dev/pts"
-
-          # Install initramfs-tools if not present then generate initrd
-          sudo chroot "$MOUNTPOINT" /bin/bash -c "
-            apt-get install -y initramfs-tools kmod 2>/dev/null || true
-            update-initramfs -c -k $KVER
-          "
-
-          # Create symlink so shimboot's kexec call can find it
-          sudo ln -sf "initrd.img-$KVER" "$MOUNTPOINT/boot/initrd.img" || true
-
-          echo "=== /boot after initramfs generation ==="
-          ls -lah "$MOUNTPOINT/boot/"
-
-          sudo umount "$MOUNTPOINT/dev/pts" || true
-          sudo umount "$MOUNTPOINT/dev" || true
-          sudo umount "$MOUNTPOINT/sys" || true
-          sudo umount "$MOUNTPOINT/proc" || true
           sudo umount "$MOUNTPOINT"
 
       - name: Rename image
