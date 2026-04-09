@@ -56,31 +56,21 @@ jobs:
             e2fsprogs kmod pv cryptsetup
 
       - name: Ensure vboot devkeys are present
-        # vboot-utils on Ubuntu sometimes doesn't ship devkeys,
-        # so we build them from source as a fallback
         run: |
           if [ ! -f "/usr/share/vboot/devkeys/recovery_kernel.keyblock" ]; then
-            echo "Devkeys not found in package, building from source..."
-            git clone --depth=1 \
-              https://chromium.googlesource.com/chromiumos/platform/vboot_reference \
-              vboot_reference
+            git clone --depth=1 https://chromium.googlesource.com/chromiumos/platform/vboot_reference
             cd vboot_reference && make -j$(nproc)
             sudo mkdir -p /usr/share/vboot/devkeys
             sudo cp tests/devkeys/* /usr/share/vboot/devkeys/
             cd ..
             rm -rf vboot_reference
-          else
-            echo "Devkeys found:"
-            ls /usr/share/vboot/devkeys/
           fi
+          ls /usr/share/vboot/devkeys/
 
       - name: Clone ChromeOS kernel 6.6
         run: |
-          git clone --depth=1 \
-            --branch chromeos-6.6 \
-            https://chromium.googlesource.com/chromiumos/third_party/kernel \
-            kernel
-          df -h
+          git clone --depth=1 --branch chromeos-6.6 \
+            https://chromium.googlesource.com/chromiumos/third_party/kernel kernel
 
       - name: Configure kernel for Octopus (Gemini Lake x86_64)
         working-directory: kernel
@@ -90,117 +80,70 @@ jobs:
           else
             make x86_64_defconfig
           fi
-          [ -f "chromeos/scripts/prepareconfig" ] && \
-            bash chromeos/scripts/prepareconfig chromiumos-x86_64 || true
-
+          [ -f "chromeos/scripts/prepareconfig" ] && bash chromeos/scripts/prepareconfig chromiumos-x86_64 || true
+          # Enable essential features
           ./scripts/config --enable CONFIG_OVERLAY_FS
           ./scripts/config --enable CONFIG_SQUASHFS
           ./scripts/config --enable CONFIG_SQUASHFS_XZ
-          ./scripts/config --enable CONFIG_SQUASHFS_LZ4
-          ./scripts/config --enable CONFIG_SQUASHFS_ZLIB
           ./scripts/config --enable CONFIG_SWAP
           ./scripts/config --enable CONFIG_ZSWAP
           ./scripts/config --enable CONFIG_ZRAM
           ./scripts/config --enable CONFIG_CGROUPS
-          ./scripts/config --enable CONFIG_CGROUP_BPF
-          ./scripts/config --enable CONFIG_MEMCG
-          ./scripts/config --enable CONFIG_CGROUP_DEVICE
-          ./scripts/config --enable CONFIG_CGROUP_CPUACCT
-          ./scripts/config --enable CONFIG_CGROUP_PIDS
-          ./scripts/config --enable CONFIG_CGROUP_FREEZER
-          ./scripts/config --enable CONFIG_IO_URING
-          ./scripts/config --enable CONFIG_NAMESPACES
-          ./scripts/config --enable CONFIG_USER_NS
-          ./scripts/config --enable CONFIG_PID_NS
-          ./scripts/config --enable CONFIG_NET_NS
-          ./scripts/config --enable CONFIG_UTS_NS
-          ./scripts/config --enable CONFIG_IPC_NS
-          ./scripts/config --enable CONFIG_BPF
-          ./scripts/config --enable CONFIG_BPF_SYSCALL
           ./scripts/config --enable CONFIG_EXT4_FS
           ./scripts/config --enable CONFIG_BTRFS_FS
-          ./scripts/config --enable CONFIG_TMPFS
           ./scripts/config --enable CONFIG_TMPFS_POSIX_ACL
-          ./scripts/config --enable CONFIG_MMC
-          ./scripts/config --enable CONFIG_MMC_SDHCI
           ./scripts/config --enable CONFIG_MMC_SDHCI_ACPI
-          ./scripts/config --enable CONFIG_MMC_SDHCI_PCI
           ./scripts/config --enable CONFIG_IWLWIFI
-          ./scripts/config --enable CONFIG_IWLMVM
-          ./scripts/config --enable CONFIG_DRM
           ./scripts/config --enable CONFIG_DRM_I915
           ./scripts/config --enable CONFIG_SND_HDA_INTEL
-          ./scripts/config --enable CONFIG_SND_HDA_CODEC_HDMI
-          ./scripts/config --enable CONFIG_USB_SUPPORT
-          ./scripts/config --enable CONFIG_USB_XHCI_HCD
           make olddefconfig
 
       - name: Build kernel and modules
         working-directory: kernel
         run: |
-          make -j$(nproc) bzImage modules 2>&1 | tail -20
+          make -j$(nproc) bzImage modules
 
-      - name: Save kernel artifacts and delete source
+      - name: Save kernel artifacts
         run: |
           cp kernel/arch/x86/boot/bzImage ./bzImage
           cp kernel/.config ./kernel.config
           sudo make -C kernel INSTALL_MOD_PATH=$(pwd)/kernel_modules modules_install
           rm -rf kernel
-          echo "Kernel version directory:"
-          ls kernel_modules/lib/modules/
-          echo "=== Disk after kernel source deletion ==="
-          df -h
 
       - name: Clone shimboot
         run: git clone --depth=1 https://github.com/ading2210/shimboot shimboot
 
-      - name: Build shimboot image
+      - name: Build shimboot image (using its default kernel first)
         working-directory: shimboot
         run: |
           sudo ./build_complete.sh "${{ github.event.inputs.board_name }}" \
             desktop="${{ github.event.inputs.desktop }}" \
-            2>&1 | grep -av "^[[:space:]]*[0-9]\+K" | tee /tmp/shimboot_build.log || true
-          echo "=== Last 20 lines of build log ==="
-          tail -20 /tmp/shimboot_build.log
-          echo "=== Contents of data/ ==="
-          ls -lah data/ || echo "data/ does not exist"
-          df -h
-          test -f "data/shimboot_${{ github.event.inputs.board_name }}.bin" || \
-            { echo "FATAL: shimboot image not produced"; exit 1; }
+            2>&1 | grep -av "^[[:space:]]*[0-9]\+K" | tee /tmp/shimboot_build.log
+          test -f "data/shimboot_${{ github.event.inputs.board_name }}.bin" || exit 1
 
-      - name: Sign 6.6 kernel with devkeys and swap partition 2
-        # Developer mode relaxes vboot signature checks for recovery boots so
-        # standard devkeys work fine - this is exactly what shimboot itself uses
-        # internally to sign its own partition 2 kernel.
+      - name: Replace kernel partition with custom 6.6 kernel (proper signing)
         run: |
           IMAGE="shimboot/data/shimboot_${{ github.event.inputs.board_name }}.bin"
-
-          echo "=== Partition table ==="
-          sudo cgpt show "$IMAGE"
-
-          # Extract cmdline from the existing shimboot partition 2 kernel
-          # so shimboot's init script still gets the args it expects
+          # Get partition 2 offsets
           KERN_START=$(sudo cgpt show -i 2 -b "$IMAGE")
           KERN_SIZE=$(sudo cgpt show -i 2 -s "$IMAGE")
           echo "Partition 2: start=$KERN_START sectors, size=$KERN_SIZE sectors"
 
-          sudo dd if="$IMAGE" of=existing_kern.img \
-            bs=512 skip="$KERN_START" count="$KERN_SIZE" 2>/dev/null
-
-          CMDLINE=$(futility dump_kernel_config existing_kern.img 2>/dev/null || echo "")
+          # Extract cmdline from the existing shimboot kernel (preserve boot args)
+          sudo dd if="$IMAGE" of=old_kern.img bs=512 skip="$KERN_START" count="$KERN_SIZE" 2>/dev/null
+          CMDLINE=$(futility dump_kernel_config old_kern.img 2>/dev/null | head -n1)
           if [ -z "$CMDLINE" ]; then
-            echo "Warning: could not extract cmdline, using safe default"
+            # fallback to a working shimboot cmdline
             CMDLINE="console=tty1 init=/sbin/init rootwait ro"
           fi
-          echo "Cmdline: $CMDLINE"
+          echo "Using cmdline: $CMDLINE"
           echo "$CMDLINE" > kernel.cmdline
-          rm -f existing_kern.img
+          rm -f old_kern.img
 
-          echo "=== Devkeys available ==="
-          ls /usr/share/vboot/devkeys/
+          # Create a 512-byte bootloader stub (same as shimboot)
+          dd if=/dev/zero of=bootloader.bin bs=512 count=1 2>/dev/null
 
-          # Sign our 6.6 kernel with devkeys
-          dd if=/dev/zero of=bootloader.bin bs=512 count=1
+          # Sign the new kernel using the exact same command as shimboot's build_complete.sh
           futility vbutil_kernel \
             --pack kernel.vboot \
             --keyblock /usr/share/vboot/devkeys/recovery_kernel.keyblock \
@@ -211,86 +154,69 @@ jobs:
             --version 1 \
             --arch x86_64
 
-          futility vbutil_kernel --verify kernel.vboot
-          rm -f bootloader.bin bzImage kernel.cmdline
+          # Verify the signed kernel
+          futility vbutil_kernel --verify kernel.vboot || { echo "Signing failed"; exit 1; }
 
-          # Check it fits
-          NEW_KERN_SECTORS=$(( ($(stat -c%s kernel.vboot) + 511) / 512 ))
-          echo "New kernel: $NEW_KERN_SECTORS sectors, partition has: $KERN_SIZE sectors"
-          if [ "$NEW_KERN_SECTORS" -gt "$KERN_SIZE" ]; then
-            echo "ERROR: kernel too large for partition 2"
+          # Check size
+          NEW_SECTORS=$(( ($(stat -c%s kernel.vboot) + 511) / 512 ))
+          if [ $NEW_SECTORS -gt $KERN_SIZE ]; then
+            echo "ERROR: kernel too large ($NEW_SECTORS > $KERN_SIZE sectors)"
             exit 1
           fi
 
-          # Wipe and rewrite partition 2
-          sudo dd if=/dev/zero of="$IMAGE" bs=512 \
-            seek="$KERN_START" count="$KERN_SIZE" conv=notrunc
-          sudo dd if=kernel.vboot of="$IMAGE" bs=512 \
-            seek="$KERN_START" conv=notrunc
-          rm -f kernel.vboot
+          # Write the new kernel
+          sudo dd if=/dev/zero of="$IMAGE" bs=512 seek="$KERN_START" count="$KERN_SIZE" conv=notrunc 2>/dev/null
+          sudo dd if=kernel.vboot of="$IMAGE" bs=512 seek="$KERN_START" conv=notrunc 2>/dev/null
 
-          echo "Partition 2 swap complete"
-          df -h
+          # Set boot flags: priority=1, tries=0, successful=1 (required for ChromeOS vboot)
+          sudo cgpt add -i 2 -P 1 -T 0 -S 1 "$IMAGE"
 
-      - name: Inject modules into shimboot Debian rootfs
+          # Cleanup
+          rm -f kernel.vboot bootloader.bin kernel.cmdline bzImage
+
+      - name: Inject custom kernel modules into rootfs
         run: |
           IMAGE="shimboot/data/shimboot_${{ github.event.inputs.board_name }}.bin"
           KVER=$(ls kernel_modules/lib/modules/)
-          MOUNTPOINT="/mnt/shimboot_rootfs"
-          echo "Injecting modules for: $KVER"
+          echo "Injecting modules for $KVER"
 
           ROOTFS_START=$(sudo cgpt show -i 4 -b "$IMAGE")
           OFFSET=$(( ROOTFS_START * 512 ))
+          MOUNT="/mnt/shimboot_rootfs"
+          sudo mkdir -p "$MOUNT"
+          sudo mount -o loop,offset=$OFFSET "$IMAGE" "$MOUNT"
 
-          sudo mkdir -p "$MOUNTPOINT"
-          sudo mount -o loop,offset=$OFFSET "$IMAGE" "$MOUNTPOINT"
+          # Remove any old modules
+          sudo rm -rf "$MOUNT/lib/modules"/*
+          sudo mkdir -p "$MOUNT/lib/modules"
+          sudo cp -r "kernel_modules/lib/modules/$KVER" "$MOUNT/lib/modules/"
+          sudo depmod -b "$MOUNT" "$KVER"
 
-          sudo mkdir -p "$MOUNTPOINT/lib/modules"
+          sudo umount "$MOUNT"
 
-          # Remove any old kernel modules
-          for old in "$MOUNTPOINT"/lib/modules/*/; do
-            echo "Removing old modules: $old"
-            sudo rm -rf "$old"
-          done
-
-          sudo cp -r kernel_modules/lib/modules/$KVER "$MOUNTPOINT/lib/modules/"
-          sudo depmod -b "$MOUNTPOINT" $KVER || \
-            echo "Warning: depmod failed"
-
-          echo "=== Installed modules ==="
-          ls "$MOUNTPOINT/lib/modules/"
-
-          sudo umount "$MOUNTPOINT"
-
-      - name: Rename image
+      - name: Verify final kernel signature (debug)
         run: |
-          sudo mv shimboot/data/shimboot_${{ github.event.inputs.board_name }}.bin \
-             shimboot/data/shimboot_image.bin
-          ls -lah shimboot/data/
+          IMAGE="shimboot/data/shimboot_${{ github.event.inputs.board_name }}.bin"
+          echo "=== Final kernel partition verification ==="
+          KERN_START=$(sudo cgpt show -i 2 -b "$IMAGE")
+          KERN_SIZE=$(sudo cgpt show -i 2 -s "$IMAGE")
+          sudo dd if="$IMAGE" of=final_kern.bin bs=512 skip="$KERN_START" count="$KERN_SIZE" 2>/dev/null
+          futility vbutil_kernel --verify final_kern.bin || echo "WARNING: final kernel signature invalid!"
+          futility dump_kernel_config final_kern.bin
+          rm -f final_kern.bin
 
-      - name: Delete large intermediate artifacts to free disk
+      - name: Rename and zip final image
         run: |
-          sudo rm -rf \
-            shimboot/data/reco_${{ github.event.inputs.board_name }}.bin \
-            shimboot/data/shim_${{ github.event.inputs.board_name }}.bin \
-            shimboot/data/rootfs_${{ github.event.inputs.board_name }} \
-            kernel_modules
-          echo "=== Disk after cleanup ==="
-          df -h
-
-      - name: Zip final image
-        run: |
-          sudo zip -j shimboot_${{ github.event.inputs.board_name }}_chromeos-6.6.zip \
-            shimboot/data/shimboot_image.bin
-          ls -lh shimboot_${{ github.event.inputs.board_name }}_chromeos-6.6.zip
+          sudo mv shimboot/data/shimboot_${{ github.event.inputs.board_name }}.bin shimboot_image.bin
+          zip -j shimboot-${{ github.event.inputs.board_name }}-6.6.zip shimboot_image.bin
+          ls -lh shimboot-*.zip
 
       - name: Upload bootable shimboot image
         uses: actions/upload-artifact@v4
         with:
           name: shimboot-${{ github.event.inputs.board_name }}-chromeos-6.6
-          path: shimboot_${{ github.event.inputs.board_name }}_chromeos-6.6.zip
+          path: shimboot-${{ github.event.inputs.board_name }}-6.6.zip
           retention-days: 30
-          if-no-files-found: error
 
       - name: Upload kernel config
         uses: actions/upload-artifact@v4
@@ -298,4 +224,3 @@ jobs:
           name: kernel-config
           path: kernel.config
           retention-days: 30
-          if-no-files-found: error
