@@ -183,6 +183,7 @@ jobs:
             OLD_KVER=$(basename "$OLD_VMLINUZ" | sed 's/vmlinuz-//')
             echo "Replacing existing kernel: $OLD_KVER"
             sudo rm -f "$MOUNTPOINT/boot/vmlinuz-$OLD_KVER"
+            sudo rm -f "$MOUNTPOINT/boot/initrd.img-$OLD_KVER"
             sudo rm -f "$MOUNTPOINT/boot/System.map-$OLD_KVER"
             sudo rm -rf "$MOUNTPOINT/lib/modules/$OLD_KVER"
           fi
@@ -199,6 +200,42 @@ jobs:
           echo "=== Installed modules ==="
           ls "$MOUNTPOINT/lib/modules/"
 
+          sudo umount "$MOUNTPOINT"
+
+      - name: Generate initramfs for injected kernel
+        run: |
+          IMAGE="shimboot/data/shimboot_${{ github.event.inputs.board_name }}.bin"
+          KVER=$(ls kernel_modules/lib/modules/)
+          MOUNTPOINT="/mnt/shimboot_rootfs"
+
+          ROOTFS_START=$(sudo cgpt show -i 4 -b "$IMAGE")
+          OFFSET=$(( ROOTFS_START * 512 ))
+
+          sudo mkdir -p "$MOUNTPOINT"
+          sudo mount -o loop,offset=$OFFSET "$IMAGE" "$MOUNTPOINT"
+
+          # Mount pseudo filesystems needed for chroot
+          sudo mount --bind /proc "$MOUNTPOINT/proc"
+          sudo mount --bind /sys "$MOUNTPOINT/sys"
+          sudo mount --bind /dev "$MOUNTPOINT/dev"
+          sudo mount --bind /dev/pts "$MOUNTPOINT/dev/pts"
+
+          # Install initramfs-tools if not present then generate initrd
+          sudo chroot "$MOUNTPOINT" /bin/bash -c "
+            apt-get install -y initramfs-tools kmod 2>/dev/null || true
+            update-initramfs -c -k $KVER
+          "
+
+          # Create symlink so shimboot's kexec call can find it
+          sudo ln -sf "initrd.img-$KVER" "$MOUNTPOINT/boot/initrd.img" || true
+
+          echo "=== /boot after initramfs generation ==="
+          ls -lah "$MOUNTPOINT/boot/"
+
+          sudo umount "$MOUNTPOINT/dev/pts" || true
+          sudo umount "$MOUNTPOINT/dev" || true
+          sudo umount "$MOUNTPOINT/sys" || true
+          sudo umount "$MOUNTPOINT/proc" || true
           sudo umount "$MOUNTPOINT"
 
       - name: Rename image
