@@ -134,13 +134,16 @@ jobs:
       - name: Build shimboot image
         working-directory: shimboot
         run: |
-          set -x
           sudo ./build_complete.sh "${{ github.event.inputs.board_name }}" \
-            desktop="${{ github.event.inputs.desktop }}"
-          echo "=== Exit code: $? ==="
+            desktop="${{ github.event.inputs.desktop }}" \
+            2>&1 | tee /tmp/shimboot_build.log || true
+          echo "=== Last 100 lines of build log ==="
+          tail -100 /tmp/shimboot_build.log
           echo "=== Contents of data/ ==="
           ls -lah data/ || echo "data/ does not exist"
+          echo "=== Disk usage ==="
           df -h
+          test -f data/shimboot_image.bin || { echo "FATAL: shimboot_image.bin not produced"; exit 1; }
 
       - name: Extract cmdline from shimboot image kernel
         run: |
