@@ -137,18 +137,16 @@ jobs:
             2>&1 | grep -av "^[[:space:]]*[0-9]\+K" | tee /tmp/shimboot_build.log
           test -f "data/shimboot_${{ github.event.inputs.board_name }}.bin" || exit 1
 
-      - name: Replace kernel partition with custom 6.6 kernel (fixed signing)
+      - name: Replace kernel partition with custom 6.6 kernel (no --pad)
         run: |
           IMAGE="shimboot/data/shimboot_${{ github.event.inputs.board_name }}.bin"
           KERN_START=$(sudo cgpt show -i 2 -b "$IMAGE")
           KERN_SIZE=$(sudo cgpt show -i 2 -s "$IMAGE")
           echo "Partition 2: start=$KERN_START sectors, size=$KERN_SIZE sectors"
 
-          # Extract the existing kernel to get its bootloader (which is known to work)
+          # Extract existing kernel to get bootloader and cmdline
           sudo dd if="$IMAGE" of=existing_kern.bin bs=512 skip="$KERN_START" count="$KERN_SIZE" 2>/dev/null
-          # Extract bootloader from the existing kernel (first 512 bytes)
           dd if=existing_kern.bin of=bootloader.bin bs=512 count=1 2>/dev/null
-          # Extract cmdline from existing kernel
           CMDLINE=$(futility dump_kernel_config existing_kern.bin 2>/dev/null | head -n1)
           if [ -z "$CMDLINE" ]; then
             CMDLINE="console=tty1 init=/sbin/init rootwait ro"
@@ -157,7 +155,7 @@ jobs:
           echo "$CMDLINE" > kernel.cmdline
           rm -f existing_kern.bin
 
-          # Sign the new kernel with --pad to exactly fill the partition
+          # Sign WITHOUT --pad (let it be naturally sized)
           futility vbutil_kernel \
             --pack kernel.vboot \
             --keyblock /usr/share/vboot/devkeys/recovery_kernel.keyblock \
@@ -166,16 +164,24 @@ jobs:
             --vmlinuz bzImage \
             --bootloader bootloader.bin \
             --version 1 \
-            --arch x86_64 \
-            --pad $((KERN_SIZE * 512))
+            --arch x86_64
 
           # Verify the signed kernel
           futility vbutil_kernel --verify kernel.vboot || { echo "Signing failed"; exit 1; }
 
-          # Write back the new kernel
+          # Write kernel.vboot into partition
           sudo dd if=kernel.vboot of="$IMAGE" bs=512 seek="$KERN_START" conv=notrunc 2>/dev/null
 
-          # Set boot flags: priority=1, tries=1, successful=1
+          # Zero out the rest of the partition (if any)
+          KERN_VBOOT_SIZE=$(stat -c%s kernel.vboot)
+          KERN_VBOOT_SECTORS=$(( (KERN_VBOOT_SIZE + 511) / 512 ))
+          REMAINING_SECTORS=$((KERN_SIZE - KERN_VBOOT_SECTORS))
+          if [ $REMAINING_SECTORS -gt 0 ]; then
+            echo "Zeroing $REMAINING_SECTORS remaining sectors"
+            sudo dd if=/dev/zero of="$IMAGE" bs=512 seek=$((KERN_START + KERN_VBOOT_SECTORS)) count=$REMAINING_SECTORS conv=notrunc 2>/dev/null
+          fi
+
+          # Set boot flags
           sudo cgpt add -i 2 -P 1 -T 1 -S 1 "$IMAGE"
 
           # Cleanup
