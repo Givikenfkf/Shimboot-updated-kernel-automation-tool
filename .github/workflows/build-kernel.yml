@@ -147,7 +147,7 @@ jobs:
 
       - name: Rename image
         run: |
-          mv shimboot/data/shimboot_${{ github.event.inputs.board_name }}.bin \
+          sudo mv shimboot/data/shimboot_${{ github.event.inputs.board_name }}.bin \
              shimboot/data/shimboot_image.bin
           echo "Renamed to shimboot_image.bin"
           ls -lah shimboot/data/
